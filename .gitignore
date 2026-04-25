@@ -1,0 +1,16 @@
+.databricks
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+pytest-cache-files-*/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+chroma/
+chroma_db/
+data/chroma/*
+!data/chroma/.gitkeep

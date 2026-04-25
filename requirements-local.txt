@@ -1,0 +1,9 @@
+databricks-sql-connector
+pandas
+python-dotenv
+sentence-transformers
+chromadb
+requests
+pydantic
+streamlit
+torchvision
