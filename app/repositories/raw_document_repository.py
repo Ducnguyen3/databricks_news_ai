@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 class ExistingArticleKeys:
     link_keys: set[str]
     content_hashes: set[str]
+    exact_document_keys: set[str]
 
 
 class RawDocumentRepository:
@@ -41,7 +42,6 @@ class RawDocumentRepository:
                AND (
                    target.canonical_url = source.canonical_url
                    OR target.url = source.url
-                   OR target.checksum = source.checksum
                )
             WHEN MATCHED THEN UPDATE SET *
             WHEN NOT MATCHED THEN INSERT *
@@ -58,7 +58,7 @@ class RawDocumentRepository:
         return [row.asDict(recursive=True) for row in rows]
 
     def get_existing_article_keys(self, source_name: str) -> ExistingArticleKeys:
-        from app.ingestion.crawlers.base_crawler import raw_document_identity_key
+        from app.ingestion.crawlers.base_crawler import exact_document_identity_key, raw_document_identity_key
 
         rows = self._spark.sql(
             f"""
@@ -70,6 +70,7 @@ class RawDocumentRepository:
 
         link_keys: set[str] = set()
         content_hashes: set[str] = set()
+        exact_document_keys: set[str] = set()
         for row in rows:
             row_dict = row.asDict(recursive=True)
             url = row_dict.get("url")
@@ -81,8 +82,20 @@ class RawDocumentRepository:
                 link_keys.add(raw_document_identity_key(source_name, str(canonical_url)))
             if checksum:
                 content_hashes.add(str(checksum))
-        logger.info("[CRAWL] Loaded existing keys source=%s links=%s hashes=%s", source_name, len(link_keys), len(content_hashes))
-        return ExistingArticleKeys(link_keys=link_keys, content_hashes=content_hashes)
+            if canonical_url and checksum:
+                exact_document_keys.add(exact_document_identity_key(source_name, str(canonical_url), str(checksum)))
+        logger.info(
+            "[CRAWL] Loaded existing keys source=%s links=%s hashes=%s exact_documents=%s",
+            source_name,
+            len(link_keys),
+            len(content_hashes),
+            len(exact_document_keys),
+        )
+        return ExistingArticleKeys(
+            link_keys=link_keys,
+            content_hashes=content_hashes,
+            exact_document_keys=exact_document_keys,
+        )
 
 
 def _records_to_dataframe(spark: Any, records: list[dict[str, Any]], schema: Any) -> Any:

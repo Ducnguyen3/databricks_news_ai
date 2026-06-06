@@ -1,0 +1,9 @@
+{
+  "status": "FAIL",
+  "error": "No module named 'chromadb'",
+  "chroma_path": "data/chroma",
+  "collection_name": "news_articles",
+  "overview": {
+    "total_chunks": 0
+  }
+}

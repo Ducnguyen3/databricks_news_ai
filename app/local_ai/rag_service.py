@@ -1,18 +1,38 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 from app.config import LocalAiSettings, load_settings
+from app.local_ai.answer_evaluator import evaluate_rag_answer
+from app.local_ai.answer_validator import safe_fallback_for_topic, validate_answer_against_topic
 from app.local_ai.chunker import infer_topic_category
+from app.local_ai.databricks_client import DatabricksArticleClient
 from app.local_ai.embeddings import LocalEmbeddingModel
+from app.local_ai.media_retriever import MediaRetriever
 from app.local_ai.ollama_client import OllamaClient
-from app.local_ai.prompt_builder import PromptBuilder
+from app.local_ai.parent_article_loader import ParentArticleLoader
+from app.local_ai.prompt_builder import NO_INFO_FALLBACK, PromptBuilder, build_topic_rag_prompt
+from app.local_ai.processors.default_processor import DefaultNewsProcessor
+from app.local_ai.processors.registry import get_processor
+from app.local_ai.query_router import domain_from_topic, route_query
 from app.local_ai.reranker import SimpleReranker, normalize_text, normalized_terms, overlap_score, safe_float
-from app.local_ai.vector_store import ChromaVectorStore
+from app.local_ai.retriever import MetadataFilteringRetriever, build_structured_sources
+from app.local_ai.retrieved_article import (
+    article_metadata_by_id,
+    build_related_articles_from_retrieved_articles,
+    build_retrieved_articles,
+    build_sources_from_retrieved_articles,
+    images_by_article_id,
+)
+from app.local_ai.topic_profiles import TopicProfile, get_topic_profile
+from app.local_ai.topic_guard import validate_context_for_topic
+from app.local_ai.vector_store import ChromaUnavailableError, ChromaVectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +67,13 @@ _CATEGORY_MAX_ARTICLES = 10
 _CATEGORY_CHUNKS_PER_ARTICLE = 2
 
 
+@dataclass(frozen=True, slots=True)
+class ReferencedSourceResolution:
+    source: dict[str, Any] | None = None
+    needs_clarification: bool = False
+    message: str = ""
+
+
 class RAGService:
     def __init__(
         self,
@@ -55,13 +82,488 @@ class RAGService:
         ollama_client: OllamaClient | None = None,
         settings: LocalAiSettings | None = None,
         reranker: SimpleReranker | None = None,
+        image_repository: Any | None = None,
     ) -> None:
         self._settings = settings or load_settings().local_ai
         self._embedding_model = embedding_model
         self._vector_store = vector_store
         self._ollama_client = ollama_client
         self._reranker = reranker or SimpleReranker()
+        self._image_repository = image_repository
+        self._image_repository_loaded = image_repository is not None
         self._prompt_builder = PromptBuilder(self._settings)
+        self._last_generation_debug: dict[str, Any] = {}
+
+    def answer_structured(
+        self,
+        question: str,
+        top_k: int | None = None,
+        debug_retrieval: bool = False,
+        debug_prompt: bool = False,
+        current_context: dict[str, Any] | None = None,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
+        resolved_top_k = max(1, int(top_k or self._settings.rag_top_k))
+        rag_debug = debug_retrieval or debug_prompt or _env_flag("RAG_DEBUG")
+        followup_response = self._answer_follow_up(
+            question=question,
+            current_context=current_context,
+            debug_retrieval=debug_retrieval,
+            debug_prompt=debug_prompt,
+        )
+        if followup_response is not None:
+            return _finalize_structured_response(followup_response)
+
+        detected_intent = detect_question_intent(question)
+        query_plan = route_query(question)
+        query_plan = _apply_frontend_filters(query_plan, filters or {}, latest_article_count=resolved_top_k)
+        query_plan = _resolve_followup_route(question, query_plan, current_context)
+        if query_plan.get("answer_mode") == "followup" and query_plan.get("needs_clarification"):
+            response = _clarification_response(
+                question,
+                str(
+                    query_plan.get("clarification_message")
+                    or "Mình chưa xác định được bạn đang hỏi tiếp về tin/bài nào. Bạn hãy nhắc lại chủ đề hoặc chọn một nguồn cụ thể."
+                ),
+                query_plan,
+            )
+            return _finalize_structured_response(response)
+        if rag_debug:
+            query_plan["debug_scores"] = True
+        if detected_intent == "article_summary":
+            try:
+                summary_response = self._summarize_from_question(
+                    question,
+                    debug_retrieval=debug_retrieval,
+                    debug_prompt=debug_prompt,
+                )
+            except ChromaUnavailableError as exc:
+                return _finalize_structured_response(_chroma_unavailable_response(query_plan, exc))
+            return _finalize_structured_response(_structured_summary_response(summary_response, query_plan))
+
+        topic_profile = get_topic_profile(query_plan.get("primary_topic"))
+        retriever = MetadataFilteringRetriever(
+            vector_store=self._vector_store,
+            embedding_model=self._embedding_model,
+            retrieval_mode=self._settings.rag_retrieval_mode,
+        )
+        try:
+            retrieval_query = str(query_plan.get("standalone_query") or question)
+            retrieval_top_k = max(resolved_top_k * 3, resolved_top_k)
+            if _is_media_lookup(query_plan):
+                media_limit = _media_image_limit(query_plan)
+                retrieval_top_k = max(retrieval_top_k, media_limit * 4, 12)
+            results = retriever.retrieve(
+                query=retrieval_query,
+                query_plan=query_plan,
+                top_n=max(self._settings.rag_broad_retrieve_top_n, retrieval_top_k * 5),
+                top_k=retrieval_top_k,
+            )
+        except ChromaUnavailableError as exc:
+            return _finalize_structured_response(_chroma_unavailable_response(query_plan, exc))
+        if query_plan.get("prefer_latest"):
+            results = _select_latest_article_results(results, resolved_top_k)
+        retrieval_trace = dict(query_plan.get("_retrieval_debug") or {})
+        rerank_trace = list(query_plan.get("_rerank_debug") or [])
+        if not results:
+            if _is_media_lookup(query_plan):
+                response = _media_lookup_empty_response(question, query_plan)
+                if rag_debug:
+                    _attach_rag_trace(
+                        response,
+                        query_plan=query_plan,
+                        question=question,
+                        retrieval_trace=retrieval_trace,
+                        rerank_trace=rerank_trace,
+                        results=[],
+                        sources=[],
+                        prompt="",
+                        generation_debug={"used_llm": False, "no_answer_reason": "no related articles"},
+                        fallback_used=True,
+                        no_answer_triggered=True,
+                        no_answer_reason="no related articles",
+                        settings=self._settings,
+                    )
+                return _finalize_structured_response(response)
+            response = {
+                "answer": NO_INFO_FALLBACK,
+                "intent": query_plan["intent"],
+                "topic": query_plan.get("primary_topic"),
+                "query_plan": query_plan,
+                "sources": [],
+                "images": [],
+                "related_articles": [],
+            }
+            if rag_debug:
+                _attach_rag_trace(
+                    response,
+                    query_plan=query_plan,
+                    question=question,
+                    retrieval_trace=retrieval_trace,
+                    rerank_trace=rerank_trace,
+                    results=[],
+                    sources=[],
+                    prompt="",
+                    generation_debug={"used_llm": False},
+                    fallback_used=True,
+                    no_answer_triggered=True,
+                    no_answer_reason="no retrieval results",
+                    settings=self._settings,
+                )
+            return _finalize_structured_response(response)
+        if not _is_media_lookup(query_plan) and not _has_sufficient_evidence(results):
+            response = {
+                "answer": NO_INFO_FALLBACK,
+                "intent": query_plan["intent"],
+                "topic": query_plan.get("primary_topic"),
+                "query_plan": query_plan,
+                "sources": [],
+                "images": [],
+                "related_articles": [],
+            }
+            if rag_debug:
+                _attach_rag_trace(
+                    response,
+                    query_plan=query_plan,
+                    question=question,
+                    retrieval_trace=retrieval_trace,
+                    rerank_trace=rerank_trace,
+                    results=results,
+                    sources=[],
+                    prompt="",
+                    generation_debug={"used_llm": False},
+                    fallback_used=True,
+                    no_answer_triggered=True,
+                    no_answer_reason="retrieval scores below evidence threshold",
+                    settings=self._settings,
+                )
+            return _finalize_structured_response(response)
+        topic_guard_result = validate_context_for_topic(question, str(query_plan.get("primary_topic") or ""), results)
+        if not topic_guard_result.allowed:
+            response = _guard_failed_response(question, query_plan, topic_guard_result.reason, topic_guard_result.violations)
+            if rag_debug:
+                _attach_rag_trace(
+                    response,
+                    query_plan=query_plan,
+                    question=question,
+                    retrieval_trace=retrieval_trace,
+                    rerank_trace=rerank_trace,
+                    results=results,
+                    sources=[],
+                    prompt="",
+                    generation_debug={"used_llm": False, "answer_validator_reason": topic_guard_result.reason},
+                    fallback_used=True,
+                    no_answer_triggered=True,
+                    no_answer_reason=topic_guard_result.reason,
+                    settings=self._settings,
+                )
+            return _finalize_structured_response(response)
+
+        initial_sources = build_structured_sources(results)
+        article_ids = [str(source.get("article_id") or "") for source in initial_sources]
+        try:
+            parent_articles = ParentArticleLoader(self._vector_store).load_parent_articles(
+                article_ids=article_ids,
+                chunks_per_article=self._settings.rag_max_chunks_per_article,
+            )
+        except ChromaUnavailableError as exc:
+            return _finalize_structured_response(_chroma_unavailable_response(query_plan, exc))
+        retrieved_articles = build_retrieved_articles(results, parent_articles)
+        sources = build_sources_from_retrieved_articles(retrieved_articles) or initial_sources
+        _copy_citation_ids_to_articles(retrieved_articles, sources)
+        article_ids = [str(source.get("article_id") or "") for source in sources]
+        image_limit = _media_image_limit(query_plan) if _is_media_lookup(query_plan) else 1
+        images = MediaRetriever(
+            image_repository=self._article_image_repository(),
+            metadata_images_by_article_id=images_by_article_id(retrieved_articles),
+            article_metadata_by_id=article_metadata_by_id(retrieved_articles),
+        ).get_images_for_articles(
+            article_ids=article_ids,
+            limit_per_article=image_limit,
+            max_images=image_limit if _is_media_lookup(query_plan) else None,
+            query_terms=_media_query_terms(question, query_plan),
+        )
+        if _is_media_lookup(query_plan):
+            media_sources = _sources_for_media_lookup(sources, images)
+            response = {
+                "answer": _media_lookup_answer(question, len(images), image_limit, bool(sources)),
+                "intent": query_plan["intent"],
+                "topic": query_plan.get("primary_topic"),
+                "query_plan": _response_query_plan(query_plan, self._settings.rag_retrieval_mode),
+                "sources": media_sources,
+                "images": images,
+                "generated_image_prompts": [],
+                "related_articles": build_related_articles_from_retrieved_articles(retrieved_articles)
+                or build_related_articles(parent_articles, sources),
+            }
+            if debug_retrieval:
+                response["retrieval_debug"] = build_debug_entries(results)
+            if rag_debug:
+                _attach_rag_trace(
+                    response,
+                    query_plan=query_plan,
+                    question=question,
+                    retrieval_trace=retrieval_trace,
+                    rerank_trace=rerank_trace,
+                    results=results,
+                    sources=media_sources,
+                    prompt="",
+                    generation_debug={
+                        **self._last_generation_debug,
+                        "used_llm": False,
+                        "fallback_used": False,
+                        "extractive_answer_used": False,
+                        "no_answer_triggered": not bool(images),
+                        "no_answer_reason": "" if images else ("articles found but no matching image metadata" if sources else "no related articles"),
+                    },
+                    fallback_used=False,
+                    no_answer_triggered=not bool(images),
+                    no_answer_reason="" if images else ("articles found but no matching image metadata" if sources else "no related articles"),
+                    settings=self._settings,
+                    retrieved_articles=retrieved_articles,
+                )
+            return _finalize_structured_response(response)
+        generated_image_prompts = build_generated_image_prompts(sources, images)
+        prompt = self._build_structured_prompt(
+            question=question,
+            query_plan=query_plan,
+            results=results,
+            sources=sources,
+            images=images,
+            topic_profile=topic_profile,
+            retrieved_articles=retrieved_articles,
+        )
+        llm_answer = self._generate_answer(prompt)
+        answer_validator_reason = _invalid_generated_answer_reason(llm_answer, sources)
+        if answer_validator_reason:
+            self._last_generation_debug["answer_validator_reason"] = answer_validator_reason
+            self._last_generation_debug["llm_answer_rejected"] = True
+            llm_answer = None
+        answer = llm_answer or extractive_answer(question, results)
+        extractive_answer_used = llm_answer is None
+        if (query_plan.get("need_images") or query_plan.get("intent") == "media_lookup") and not images:
+            answer = f"{answer}\n\nHiện dữ liệu đã crawl chưa có ảnh phù hợp cho câu hỏi này."
+        answer_valid, answer_violations = validate_answer_against_topic(
+            answer=str(answer),
+            query=question,
+            topic=str(query_plan.get("primary_topic") or ""),
+            sources=sources,
+        )
+        if not answer_valid:
+            self._last_generation_debug["answer_validator_reason"] = ",".join(answer_violations)
+            self._last_generation_debug["answer_replaced_by_safe_fallback"] = True
+            answer = safe_fallback_for_topic(question, str(query_plan.get("primary_topic") or ""))
+            extractive_answer_used = True
+        citation_warnings = _citation_warnings(answer, sources)
+        response: dict[str, object] = {
+            "answer": answer,
+            "intent": query_plan["intent"],
+            "topic": query_plan.get("primary_topic"),
+            "query_plan": {
+                **_response_query_plan(query_plan, self._settings.rag_retrieval_mode),
+            },
+            "sources": sources,
+            "images": images,
+            "generated_image_prompts": generated_image_prompts,
+            "related_articles": build_related_articles_from_retrieved_articles(retrieved_articles)
+            or build_related_articles(parent_articles, sources),
+        }
+        if citation_warnings:
+            response["debug"] = {"citation_warnings": citation_warnings}
+        if debug_retrieval:
+            response["retrieval_debug"] = build_debug_entries(results)
+        if debug_prompt:
+            response["prompt_debug"] = prompt
+        if rag_debug:
+            _attach_rag_trace(
+                response,
+                query_plan=query_plan,
+                question=question,
+                retrieval_trace=retrieval_trace,
+                rerank_trace=rerank_trace,
+                results=results,
+                sources=sources,
+                prompt=prompt,
+                generation_debug={
+                    **self._last_generation_debug,
+                    "fallback_used": extractive_answer_used,
+                    "extractive_answer_used": extractive_answer_used,
+                    "no_answer_triggered": False,
+                    "no_answer_reason": "",
+                },
+                fallback_used=extractive_answer_used,
+                no_answer_triggered=False,
+                no_answer_reason="",
+                settings=self._settings,
+                retrieved_articles=retrieved_articles,
+            )
+        return _finalize_structured_response(response)
+
+    def _answer_follow_up(
+        self,
+        question: str,
+        current_context: dict[str, Any] | None,
+        debug_retrieval: bool,
+        debug_prompt: bool,
+    ) -> dict[str, object] | None:
+        if not current_context:
+            return None
+        followup_intent = detect_follow_up_intent(question)
+        if followup_intent is None:
+            return None
+
+        query_plan = _followup_query_plan(followup_intent, current_context)
+
+        if followup_intent == "followup_simplify":
+            previous_answer = str(current_context.get("previous_answer") or "").strip()
+            if not previous_answer:
+                return _clarification_response(
+                    question,
+                    "Mình chưa có câu trả lời trước đó để rút gọn. Bạn hãy hỏi lại nội dung cần tóm tắt.",
+                    query_plan,
+                )
+            prompt = (
+                "Rut gon cau tra loi sau thanh 2-3 y ngan gon, chi giu thong tin da co.\n\n"
+                f"CAU TRA LOI TRUOC:\n{previous_answer}\n\n"
+                f"YEU CAU:\n{question}\n"
+            )
+            answer = self._generate_answer(prompt) or summarize_text_for_article(previous_answer, question, max_sentences=2)
+            return {
+                "answer": answer,
+                "intent": followup_intent,
+                "topic": _context_topic(current_context),
+                "query_plan": query_plan,
+                "sources": _context_sources(current_context),
+                "images": [],
+                "related_articles": build_related_articles([], _context_sources(current_context)),
+                **({"prompt_debug": prompt} if debug_prompt else {}),
+            }
+
+        resolved = resolve_referenced_source(question, current_context)
+        if resolved.needs_clarification:
+            return _clarification_response(question, resolved.message, query_plan)
+        if resolved.source is None:
+            return None
+
+        source = resolved.source
+        if followup_intent == "followup_media_lookup":
+            images = _context_images_for_source(current_context, source)
+            answer = (
+                f"Mình tìm thấy {len(images)} ảnh liên quan đến nguồn [{source.get('citation_id')}]."
+                if images
+                else f"Trong ngữ cảnh hiện tại chưa có ảnh cho nguồn [{source.get('citation_id')}]."
+            )
+            return {
+                "answer": answer,
+                "intent": followup_intent,
+                "topic": str(source.get("topic") or source.get("primary_topic") or query_plan.get("primary_topic") or ""),
+                "query_plan": query_plan,
+                "sources": [_source_context_to_source(source)],
+                "images": images,
+                "related_articles": build_related_articles([], [_source_context_to_source(source)]),
+            }
+
+        try:
+            summary = self._summarize_referenced_source(
+                question=question,
+                source=source,
+                debug_retrieval=debug_retrieval,
+                debug_prompt=debug_prompt,
+            )
+        except ChromaUnavailableError as exc:
+            return _chroma_unavailable_response(query_plan, exc)
+        return _structured_summary_response(summary, query_plan)
+
+    def _article_image_repository(self) -> Any | None:
+        if self._image_repository_loaded:
+            return self._image_repository
+        self._image_repository_loaded = True
+        try:
+            self._image_repository = DatabricksArticleClient()
+        except Exception as exc:
+            logger.info("Article image repository is not available: %s", exc)
+            self._image_repository = None
+        return self._image_repository
+
+    def _summarize_referenced_source(
+        self,
+        question: str,
+        source: dict[str, Any],
+        debug_retrieval: bool,
+        debug_prompt: bool,
+    ) -> dict[str, object]:
+        article_id = str(source.get("article_id") or "").strip()
+        if article_id:
+            chunks = self._vector_store.get_chunks_by_article_id(article_id, limit=self._settings.summary_max_chunks)
+            if chunks:
+                return self._summarize_article_chunks(
+                    question,
+                    chunks,
+                    debug_retrieval=debug_retrieval,
+                    debug_prompt=debug_prompt,
+                )
+        url = str(source.get("url") or "").strip()
+        if url:
+            return self._summarize_by_url(
+                url,
+                prompt_question=question,
+                debug_retrieval=debug_retrieval,
+                debug_prompt=debug_prompt,
+            )
+        title = str(source.get("title") or "").strip()
+        return self._summarize_by_title(
+            title or question,
+            prompt_question=question,
+            debug_retrieval=debug_retrieval,
+            debug_prompt=debug_prompt,
+        )
+
+    def _build_structured_prompt(
+        self,
+        question: str,
+        query_plan: dict[str, Any],
+        results: list[dict[str, Any]],
+        sources: list[dict[str, Any]],
+        images: list[dict[str, Any]],
+        topic_profile: TopicProfile | None = None,
+        retrieved_articles: list[dict[str, Any]] | None = None,
+    ) -> str:
+        profile = topic_profile or get_topic_profile(query_plan.get("primary_topic"))
+        try:
+            return build_topic_rag_prompt(
+                question=question,
+                context_blocks=retrieved_articles or results,
+                topic_profile=profile,
+                query_plan=query_plan,
+                answer_mode=str(query_plan.get("answer_mode") or ""),
+            )
+        except Exception:
+            logger.warning("Topic prompt builder failed; falling back to domain processor", exc_info=True)
+        try:
+            processor = get_processor(query_plan.get("primary_topic"))
+            context = processor.build_context(
+                query=question,
+                route=query_plan,
+                retrieved_chunks=results,
+                sources=sources,
+                images=images,
+            )
+            return processor.build_prompt(context)
+        except Exception:
+            logger.warning("Domain processor failed; falling back to default processor", exc_info=True)
+        try:
+            fallback_processor = DefaultNewsProcessor()
+            context = fallback_processor.build_context(
+                query=question,
+                route=query_plan,
+                retrieved_chunks=results,
+                sources=sources,
+                images=images,
+            )
+            return fallback_processor.build_prompt(context)
+        except Exception:
+            logger.warning("Default processor failed; falling back to legacy prompt", exc_info=True)
+            return self._prompt_builder.build_qa_prompt(question, results)
 
     def answer(
         self,
@@ -326,9 +828,21 @@ class RAGService:
         return self._reranker.rerank(query, candidates, top_k=len(candidates))
 
     def _generate_answer(self, prompt: str) -> str | None:
+        self._last_generation_debug = {
+            "ollama_model": _ollama_model(self._ollama_client),
+            "used_llm": False,
+            "llm_error": "",
+            "prompt_chars": len(prompt),
+        }
         try:
-            return self._ollama_client.generate(prompt) if self._ollama_client is not None else None
-        except Exception:
+            if self._ollama_client is None:
+                self._last_generation_debug["llm_error"] = "ollama_client_not_configured"
+                return None
+            answer = self._ollama_client.generate(prompt)
+            self._last_generation_debug["used_llm"] = True
+            return answer
+        except Exception as exc:
+            self._last_generation_debug["llm_error"] = str(exc)
             logger.warning("Falling back to extractive answer because Ollama failed", exc_info=True)
             return None
 
@@ -366,6 +880,291 @@ def detect_question_intent(question: str) -> str:
     if any(keyword in normalized for keyword in _BROAD_KEYWORDS):
         return "broad_topic"
     return "specific_qa"
+
+
+def detect_follow_up_intent(question: str) -> str | None:
+    normalized = normalize_text(question)
+    if not normalized:
+        return None
+    has_reference = _has_context_reference(normalized) or _extract_citation_number(normalized) is not None
+    if any(term in normalized for term in ("tom tat ngan hon", "noi ngan gon", "ngan gon hon", "rut gon", "viet ngan hon")):
+        return "followup_simplify"
+    if any(term in normalized for term in ("cho toi xem anh", "xem anh", "hinh anh", "anh cua")) and has_reference:
+        return "followup_media_lookup"
+    if any(term in normalized for term in ("tom tat", "noi gi", "noi dung gi", "bai nay", "tin nay", "nguon nay")) and has_reference:
+        return "followup_article_summary"
+    if _extract_citation_number(normalized) is not None:
+        return "followup_citation_question"
+    if any(term in normalized for term in ("giai thich them", "y tren", "doan tren")):
+        return "followup_expand"
+    return None
+
+
+def resolve_referenced_source(question: str, current_context: dict[str, Any] | None) -> ReferencedSourceResolution:
+    if not current_context:
+        return ReferencedSourceResolution()
+    sources = _context_sources(current_context)
+    if not sources:
+        return ReferencedSourceResolution()
+
+    citation_id = _extract_citation_number(normalize_text(question))
+    if citation_id is None:
+        raw_citation = current_context.get("selected_citation_id")
+        try:
+            citation_id = int(raw_citation) if raw_citation is not None else None
+        except (TypeError, ValueError):
+            citation_id = None
+    if citation_id is not None:
+        for source in sources:
+            try:
+                if int(source.get("citation_id")) == citation_id:
+                    if not _citation_source_matches_question(question, source):
+                        return ReferencedSourceResolution()
+                    return ReferencedSourceResolution(source=source)
+            except (TypeError, ValueError):
+                continue
+        return ReferencedSourceResolution(
+            needs_clarification=True,
+            message=f"Mình không tìm thấy nguồn [{citation_id}] trong câu trả lời trước. Bạn hãy chọn lại nguồn có trong danh sách.",
+        )
+
+    selected_article_id = str(current_context.get("selected_article_id") or "").strip()
+    selected_url = str(current_context.get("selected_url") or "").strip()
+    if selected_article_id or selected_url:
+        for source in sources:
+            if selected_article_id and str(source.get("article_id") or "") == selected_article_id:
+                return ReferencedSourceResolution(source=source)
+            if selected_url and str(source.get("url") or "") == selected_url:
+                return ReferencedSourceResolution(source=source)
+
+    normalized = normalize_text(question)
+    if _has_context_reference(normalized):
+        if len(sources) == 1:
+            return ReferencedSourceResolution(source=sources[0])
+        choices = ", ".join(f"[{source.get('citation_id')}]" for source in sources if source.get("citation_id"))
+        return ReferencedSourceResolution(
+            needs_clarification=True,
+            message=f"Bạn muốn mình xử lý bài nào? Hãy chọn nguồn {choices or '[1], [2] hoặc [3]'}."
+        )
+    return ReferencedSourceResolution()
+
+
+def _citation_source_matches_question(question: str, source: dict[str, Any]) -> bool:
+    question_terms = _content_terms_for_reference_resolution(question)
+    if not question_terms:
+        return True
+    source_text = " ".join(
+        str(source.get(key) or "")
+        for key in ("title", "snippet", "source", "primary_topic", "topic")
+    )
+    source_terms = normalized_terms(source_text)
+    if not source_terms:
+        return True
+    return bool(question_terms.intersection(source_terms))
+
+
+def _content_terms_for_reference_resolution(question: str) -> set[str]:
+    stop_terms = {
+        "tom", "tat", "bai", "bao", "tin", "nguon", "source", "article",
+        "so", "la", "gi", "noi", "dung", "nay", "do", "ve", "cua",
+        "cho", "toi", "hay", "minh", "duoc", "khong", "co", "can",
+    }
+    return {
+        term
+        for term in normalized_terms(question)
+        if term not in stop_terms and not term.isdigit() and len(term) >= 3
+    }
+
+
+def _apply_frontend_filters(
+    query_plan: dict[str, Any],
+    filters: dict[str, Any],
+    latest_article_count: int,
+) -> dict[str, Any]:
+    if not filters:
+        updated = dict(query_plan)
+        updated["latest_article_count"] = max(1, int(latest_article_count))
+        return updated
+
+    updated = dict(query_plan)
+    topic = _normalize_frontend_topic(str(filters.get("topic") or ""))
+    if topic:
+        updated["primary_topic"] = topic
+        updated["domain"] = domain_from_topic(topic)
+
+    sources = filters.get("sources")
+    if isinstance(sources, list):
+        preferred_sources = [str(source) for source in sources if str(source).strip()]
+        if preferred_sources:
+            updated["preferred_sources"] = preferred_sources
+            updated["source"] = preferred_sources[0] if len(preferred_sources) == 1 else None
+
+    ticker = str(filters.get("ticker") or "").strip().upper()
+    if ticker:
+        updated["ticker"] = ticker
+        stock_symbols = list(updated.get("stock_symbols") or [])
+        if ticker not in stock_symbols:
+            stock_symbols.insert(0, ticker)
+        updated["stock_symbols"] = stock_symbols
+        updated["domain"] = "tai_chinh"
+        updated["primary_topic"] = "economy_finance_stock"
+
+    try:
+        time_range_days = int(filters.get("time_range_days") or 0)
+    except (TypeError, ValueError):
+        time_range_days = 0
+    if time_range_days > 0:
+        updated["time_range_days"] = time_range_days
+        updated["time_range"] = "all"
+    else:
+        updated["time_range_days"] = 0
+
+    updated["latest_article_count"] = max(1, int(latest_article_count))
+    updated["prefer_latest"] = True
+    return updated
+
+
+def _normalize_frontend_topic(topic: str) -> str:
+    aliases = {
+        "technology_ai_internet": "tech_ai_internet",
+        "tech_ai_internet": "tech_ai_internet",
+        "economy_finance_stock": "economy_finance_stock",
+        "politics_society": "politics_society",
+        "world_geopolitics": "world_geopolitics",
+        "business_startup": "business_startup",
+        "real_estate": "real_estate",
+        "lifestyle_education_health_entertainment": "lifestyle_education_health_entertainment",
+        "general_news": "general_news",
+    }
+    return aliases.get(topic.strip(), "")
+
+
+def _is_media_lookup(query_plan: dict[str, Any]) -> bool:
+    return str(query_plan.get("intent") or "") == "media_lookup" or bool(query_plan.get("need_images"))
+
+
+def _media_image_limit(query_plan: dict[str, Any]) -> int:
+    try:
+        value = int(query_plan.get("image_limit") or 4)
+    except (TypeError, ValueError):
+        value = 4
+    return max(1, min(12, value))
+
+
+def _media_query_terms(question: str, query_plan: dict[str, Any]) -> list[str]:
+    stop_terms = {
+        "anh",
+        "hinh",
+        "hinh anh",
+        "photo",
+        "image",
+        "cho",
+        "toi",
+        "cac",
+        "lien quan",
+        "ve",
+        "co",
+        "nao",
+        "khong",
+    }
+    terms: list[str] = []
+    terms.extend(str(item) for item in query_plan.get("entities", []) if str(item).strip())
+    terms.extend(str(item) for item in query_plan.get("lexical_terms", []) if str(item).strip())
+    for term in normalized_terms(question):
+        if term not in stop_terms and len(term) >= 3:
+            terms.append(term)
+    output: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = normalize_text(str(term))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(str(term))
+    return output
+
+
+def _response_query_plan(query_plan: dict[str, Any], retrieval_mode: str) -> dict[str, Any]:
+    return {
+        "entities": query_plan.get("entities", []),
+        "stock_symbols": query_plan.get("stock_symbols", []),
+        "primary_topic": query_plan.get("primary_topic"),
+        "domain": query_plan.get("domain", "all"),
+        "ticker": query_plan.get("ticker", ""),
+        "time_range": query_plan.get("time_range", "all"),
+        "image_limit": _media_image_limit(query_plan) if _is_media_lookup(query_plan) else int(query_plan.get("image_limit") or 0),
+        "need_images": bool(query_plan.get("need_images")),
+        "need_sources": bool(query_plan.get("need_sources")),
+        "answer_mode": query_plan.get("answer_mode", "synthesis"),
+        "standalone_query": query_plan.get("standalone_query", ""),
+        "explicit_topic": bool(query_plan.get("explicit_topic")),
+        "topic_confidence": query_plan.get("topic_confidence"),
+        "topic_confidence_label": query_plan.get("topic_confidence_label"),
+        "data_source": query_plan.get("data_source", "article_rag"),
+        "retrieval_mode": retrieval_mode,
+        "requires_lexical": bool(query_plan.get("requires_lexical")),
+        "lexical_terms": query_plan.get("lexical_terms", []),
+        "preferred_sources": query_plan.get("preferred_sources", []),
+        "latest_article_count": query_plan.get("latest_article_count"),
+        "prefer_latest": bool(query_plan.get("prefer_latest")),
+    }
+
+
+def _sources_for_media_lookup(sources: list[dict[str, Any]], images: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not images:
+        return sources
+    image_article_ids = {
+        str(image.get("article_id") or "")
+        for image in images
+        if str(image.get("article_id") or "").strip()
+    }
+    if not image_article_ids:
+        return sources
+    selected = [source for source in sources if str(source.get("article_id") or "") in image_article_ids]
+    return selected or sources
+
+
+def _media_lookup_answer(question: str, image_count: int, image_limit: int, has_related_articles: bool) -> str:
+    subject = _media_subject(question)
+    if image_count > 0:
+        if image_count >= image_limit:
+            return (
+                f"Tìm thấy {image_count} ảnh liên quan đến {subject} từ các bài báo đã thu thập. "
+                "Bạn có thể xem nguồn bài viết đi kèm bên dưới."
+            )
+        return f"Tìm thấy {image_count} ảnh liên quan đến {subject} từ dữ liệu hiện có."
+    if has_related_articles:
+        return f"Hệ thống tìm thấy bài viết liên quan đến {subject}, nhưng các bài này chưa có metadata ảnh phù hợp."
+    return f"Dữ liệu hiện tại chưa có bài viết phù hợp về {subject}."
+
+
+def _media_lookup_empty_response(question: str, query_plan: dict[str, Any]) -> dict[str, object]:
+    return {
+        "answer": _media_lookup_answer(question, 0, _media_image_limit(query_plan), False),
+        "intent": query_plan["intent"],
+        "topic": query_plan.get("primary_topic"),
+        "query_plan": query_plan,
+        "sources": [],
+        "images": [],
+        "generated_image_prompts": [],
+        "related_articles": [],
+    }
+
+
+def _media_subject(question: str) -> str:
+    subject = str(question or "")
+    patterns = (
+        r"cho\s+(?:tôi|toi|mình|minh)\s+(?:các\s+|cac\s+)?(?:ảnh|anh|hình ảnh|hinh anh|hình|hinh|photo|image)\s+(?:liên quan đến|lien quan den|về|ve)?",
+        r"(?:có|co)\s+(?:ảnh|anh|hình ảnh|hinh anh|hình|hinh)\s+nào\s+(?:về|ve)",
+        r"(?:ảnh|anh|hình ảnh|hinh anh|hình|hinh|photo|image)\s+(?:liên quan đến|lien quan den|về|ve)",
+        r"^\s*(?:ảnh|anh|hình ảnh|hinh anh|hình|hinh|photo|image)\s*",
+    )
+    for pattern in patterns:
+        subject = re.sub(pattern, " ", subject, flags=re.IGNORECASE)
+    subject = re.sub(r"\s+", " ", subject).strip(" ?.!:,;")
+    if subject:
+        return subject
+    return "chủ đề được hỏi"
 
 
 def detect_topic_category(question: str) -> str | None:
@@ -546,13 +1345,21 @@ def build_sources(results: list[dict[str, object]]) -> list[dict[str, str]]:
         if not chunk_id or chunk_id in seen:
             continue
         seen.add(chunk_id)
+        topic = str(metadata.get("primary_topic") or "")
         sources.append(
             {
+                "citation_id": len(sources) + 1,
+                "article_id": str(metadata.get("article_id") or ""),
                 "title": str(metadata.get("title") or ""),
                 "source": str(metadata.get("source") or ""),
                 "url": str(metadata.get("url") or ""),
                 "category": str(metadata.get("category") or ""),
                 "published_at": str(metadata.get("published_at") or ""),
+                "primary_topic": topic,
+                "topic": topic,
+                "domain": domain_from_topic(topic),
+                "score": max(safe_float(result.get("final_score")), safe_float(result.get("score"))),
+                "snippet": _snippet(result.get("text") or result.get("document") or ""),
                 "chunk_id": chunk_id,
             }
         )
@@ -565,17 +1372,135 @@ def build_article_sources(articles: list[dict[str, object]]) -> list[dict[str, s
         article_id = str(article.get("article_id") or "")
         if not article_id:
             continue
+        topic = str(article.get("primary_topic") or article.get("topic") or "")
         sources.append(
             {
+                "citation_id": len(sources) + 1,
+                "article_id": article_id,
                 "title": str(article.get("title") or ""),
                 "source": str(article.get("source") or ""),
                 "url": str(article.get("url") or ""),
                 "category": str(article.get("category") or ""),
                 "published_at": str(article.get("published_at") or ""),
+                "primary_topic": topic,
+                "topic": topic,
+                "domain": domain_from_topic(topic),
+                "score": safe_float(article.get("relevance_score") or article.get("score")),
+                "snippet": _snippet(article.get("summary") or article.get("content") or ""),
                 "chunk_id": article_id,
             }
         )
     return sources
+
+
+def _copy_citation_ids_to_articles(articles: list[dict[str, Any]], sources: list[dict[str, Any]]) -> None:
+    citation_by_article_id = {
+        str(source.get("article_id") or ""): source.get("citation_id")
+        for source in sources
+        if str(source.get("article_id") or "")
+    }
+    for index, article in enumerate(articles, start=1):
+        article_id = str(article.get("article_id") or "")
+        article["citation_id"] = citation_by_article_id.get(article_id) or index
+
+
+def _citation_warnings(answer: str, sources: list[dict[str, Any]]) -> list[str]:
+    cited_ids = {int(match.group(1)) for match in re.finditer(r"\[(\d+)\]", str(answer or ""))}
+    if not cited_ids:
+        return []
+    valid_ids: set[int] = set()
+    for source in sources:
+        try:
+            valid_ids.add(int(source.get("citation_id")))
+        except (TypeError, ValueError):
+            continue
+    invalid_ids = sorted(cited_ids - valid_ids)
+    return [f"citation_id_not_in_sources: [{citation_id}]" for citation_id in invalid_ids]
+
+
+def _snippet(value: Any, max_chars: int = 240) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def _structured_summary_response(response: dict[str, object], query_plan: dict[str, Any]) -> dict[str, object]:
+    structured = dict(response)
+    sources = structured.get("sources") if isinstance(structured.get("sources"), list) else []
+    topic = ""
+    if sources and isinstance(sources[0], dict):
+        topic = str(sources[0].get("primary_topic") or sources[0].get("topic") or "")
+    structured["intent"] = "article_summary"
+    structured["topic"] = topic or query_plan.get("primary_topic")
+    structured["query_plan"] = {
+        **query_plan,
+        "intent": "article_summary",
+        "data_source": "article_rag",
+    }
+    structured["sources"] = sources
+    structured.setdefault("images", [])
+    structured.setdefault("related_articles", build_related_articles([], sources))
+    return structured
+
+
+def _chroma_unavailable_response(query_plan: dict[str, Any], exc: ChromaUnavailableError) -> dict[str, object]:
+    return {
+        "answer": "Hiện chưa thể truy vấn vì Chroma index local đang lỗi hoặc chưa sẵn sàng. Cần chạy healthcheck/rebuild index.",
+        "intent": query_plan.get("intent", "unknown"),
+        "topic": query_plan.get("primary_topic"),
+        "query_plan": query_plan,
+        "sources": [],
+        "images": [],
+        "related_articles": [],
+        "debug": {
+            "error": "CHROMA_UNAVAILABLE",
+            "error_code": exc.error_code,
+            "message": str(exc),
+            "suggestion": "Run scripts/inspect_chroma_health.py or rebuild Chroma from Gold",
+        },
+    }
+
+
+def _guard_failed_response(
+    question: str,
+    query_plan: dict[str, Any],
+    reason: str,
+    violations: list[str],
+) -> dict[str, object]:
+    topic = str(query_plan.get("primary_topic") or "")
+    return {
+        "answer": safe_fallback_for_topic(question, topic),
+        "intent": query_plan.get("intent", "unknown"),
+        "topic": query_plan.get("primary_topic"),
+        "query_plan": query_plan,
+        "sources": [],
+        "images": [],
+        "related_articles": [],
+        "debug": {
+            "guard_failed": True,
+            "guard_reason": reason,
+            "guard_violations": violations,
+        },
+    }
+
+
+def _finalize_structured_response(response: dict[str, object]) -> dict[str, object]:
+    response.setdefault("images", [])
+    if "generated_image_prompts" not in response:
+        sources = response.get("sources") if isinstance(response.get("sources"), list) else []
+        images = response.get("images") if isinstance(response.get("images"), list) else []
+        response["generated_image_prompts"] = build_generated_image_prompts(sources, images)
+    evaluation = evaluate_rag_answer(response)
+    response["evaluation"] = evaluation
+    logger.info(
+        "[RAG_EVAL] status=%s sources=%s images=%s reason=%s",
+        evaluation["status"],
+        evaluation["source_count"],
+        evaluation["image_count"],
+        evaluation["reason"],
+    )
+    return response
 
 
 def article_from_chunks(chunks: list[dict[str, object]]) -> dict[str, object]:
@@ -606,27 +1531,300 @@ def flatten_article_chunks(articles: list[dict[str, object]]) -> list[dict[str, 
     return flattened
 
 
-def build_debug_entries(results: list[dict[str, object]]) -> list[dict[str, str]]:
-    entries: list[dict[str, str]] = []
+def build_debug_entries(results: list[dict[str, object]]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
     for result in results:
         metadata = result.get("metadata", {})
         if not isinstance(metadata, dict):
             metadata = {}
         preview = " ".join(str(result.get("text") or "").split())[:180]
-        entries.append(
-            {
+        entry = {
                 "chunk_id": str(result.get("chunk_id") or ""),
                 "article_id": str(metadata.get("article_id") or result.get("article_id") or ""),
                 "title": str(metadata.get("title") or result.get("title") or ""),
                 "source": str(metadata.get("source") or result.get("source") or ""),
                 "category": str(metadata.get("category") or result.get("category") or ""),
                 "vector_score": f"{safe_float(result.get('vector_score') or result.get('score')):.4f}",
+                "keyword_score": f"{safe_float(result.get('keyword_score')):.4f}",
+                "topic_score": f"{safe_float(result.get('combined_topic_score') or result.get('topic_match')):.4f}",
+                "topic_penalty": f"{safe_float(result.get('topic_penalty')):.4f}",
+                "recency_score": f"{safe_float(result.get('recency_score')):.4f}",
+                "entity_score": f"{safe_float(result.get('combined_entity_score') or result.get('entity_match')):.4f}",
                 "final_score": f"{safe_float(result.get('final_score') or result.get('score')):.4f}",
+                "topic": str(metadata.get("primary_topic") or metadata.get("topic") or metadata.get("topic_category") or ""),
+                "matched_keywords": ", ".join(str(item) for item in result.get("matched_keywords", []) if str(item).strip()),
                 "url": str(metadata.get("url") or result.get("url") or ""),
                 "preview_text": preview,
             }
-        )
+        if isinstance(result.get("debug_score"), dict):
+            entry["debug_score"] = result["debug_score"]
+        entries.append(entry)
     return entries
+
+
+def _attach_rag_trace(
+    response: dict[str, object],
+    *,
+    query_plan: dict[str, Any],
+    question: str,
+    retrieval_trace: dict[str, Any],
+    rerank_trace: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    prompt: str,
+    generation_debug: dict[str, Any],
+    fallback_used: bool,
+    no_answer_triggered: bool,
+    no_answer_reason: str,
+    settings: LocalAiSettings,
+    retrieved_articles: list[dict[str, Any]] | None = None,
+) -> None:
+    router = _router_debug(question, query_plan)
+    retrieval = _normalized_retrieval_trace(retrieval_trace, query_plan, results, settings)
+    rerank = _normalized_rerank_trace(rerank_trace, results)
+    context_builder = _context_builder_debug(results, sources, prompt, settings, retrieved_articles)
+    prompt_info = _normalized_prompt_trace(prompt, sources, results, settings)
+    trace = {
+        "query_plan": _public_query_plan_debug(query_plan),
+        "router": router,
+        "retrieval": retrieval,
+        "rerank": rerank,
+        "context_builder": context_builder,
+        "prompt": prompt_info,
+        "generation": {
+            "ollama_model": generation_debug.get("ollama_model") or "",
+            "llm_model": generation_debug.get("ollama_model") or "",
+            "used_llm": bool(generation_debug.get("used_llm")),
+            "llm_error": str(generation_debug.get("llm_error") or ""),
+            "fallback_used": bool(generation_debug.get("fallback_used", fallback_used)),
+            "no_answer_triggered": bool(generation_debug.get("no_answer_triggered", no_answer_triggered)),
+            "no_answer_reason": str(generation_debug.get("no_answer_reason") or no_answer_reason or ""),
+            "answer_validator_reason": str(generation_debug.get("answer_validator_reason") or ""),
+            "extractive_answer_used": bool(generation_debug.get("extractive_answer_used", fallback_used)),
+        },
+    }
+    query_debug = response.get("query_plan")
+    if isinstance(query_debug, dict):
+        query_debug["debug_trace"] = trace
+        query_debug["router_debug"] = trace["router"]
+    debug = response.get("debug") if isinstance(response.get("debug"), dict) else {}
+    debug["rag_trace"] = trace
+    response["debug"] = debug
+
+
+def _router_debug(question: str, query_plan: dict[str, Any]) -> dict[str, Any]:
+    selected_topic = str(query_plan.get("primary_topic") or "")
+    topic_scores = query_plan.get("topic_scores") if isinstance(query_plan.get("topic_scores"), dict) else {}
+    matched = query_plan.get("topic_matched_keywords") if isinstance(query_plan.get("topic_matched_keywords"), dict) else {}
+    return {
+        "original_query": question,
+        "normalized_query": str(query_plan.get("normalized_query") or normalize_text(question)),
+        "intent": str(query_plan.get("intent") or ""),
+        "answer_mode": str(query_plan.get("answer_mode") or ""),
+        "standalone_query": str(query_plan.get("standalone_query") or ""),
+        "selected_topic": selected_topic,
+        "explicit_topic": bool(query_plan.get("explicit_topic")),
+        "topic_confidence": query_plan.get("topic_confidence"),
+        "topic_confidence_label": str(query_plan.get("topic_confidence_label") or ""),
+        "topic_scores": {topic: int(topic_scores.get(topic, 0) or 0) for topic in _REQUIRED_TOPICS},
+        "matched_keywords": {topic: list(matched.get(topic, []) or []) for topic in _REQUIRED_TOPICS},
+        "reason": _router_reason(query_plan),
+    }
+
+
+def _public_query_plan_debug(query_plan: dict[str, Any]) -> dict[str, Any]:
+    omitted = {"_retrieval_debug", "_rerank_debug", "_topic_guard_filter", "debug_trace", "router_debug"}
+    return {key: value for key, value in query_plan.items() if key not in omitted and not str(key).startswith("_")}
+
+
+def _normalized_retrieval_trace(
+    retrieval_trace: dict[str, Any],
+    query_plan: dict[str, Any],
+    results: list[dict[str, Any]],
+    settings: LocalAiSettings,
+) -> dict[str, Any]:
+    trace = dict(retrieval_trace or {})
+    topic_guard = dict(trace.get("topic_guard") or query_plan.get("_topic_guard_filter") or {})
+    top_before = trace.get("top_candidates_before_filter") or build_debug_entries(results[:10])
+    top_after_topic = trace.get("top_candidates_after_topic_filter") or top_before
+    top_after_metadata = trace.get("top_candidates_after_metadata_filter") or build_debug_entries(results[:10])
+    return {
+        "broad_retrieve_top_n": int(trace.get("broad_retrieve_top_n") or settings.rag_broad_retrieve_top_n),
+        "raw_candidate_count": int(trace.get("raw_candidate_count") or len(results)),
+        "candidate_count_before_topic_filter": int(trace.get("candidate_count_before_topic_filter") or len(results)),
+        "candidate_count_after_topic_filter": int(trace.get("candidate_count_after_topic_filter") or len(results)),
+        "candidate_count_after_metadata_filter": int(trace.get("candidate_count_after_metadata_filter") or len(results)),
+        "source_diversity_count": int(trace.get("source_diversity_count") or _source_diversity_count_from_results(results)),
+        "metadata_filter_applied": bool(trace.get("metadata_filter_applied", False)),
+        "topic_filter_applied": bool(trace.get("topic_filter_applied", False)),
+        "fallback_used": bool(trace.get("fallback_used", False)),
+        "fallback_reason": str(trace.get("fallback_reason") or ""),
+        "fallback_strategy": str(trace.get("fallback_strategy") or ""),
+        "selected_topic": str(trace.get("selected_topic") or query_plan.get("primary_topic") or ""),
+        "top_candidates_before_filter": list(top_before)[:10],
+        "top_candidates_after_topic_filter": list(top_after_topic)[:10],
+        "top_candidates_after_metadata_filter": list(top_after_metadata)[:10],
+        "topic_guard": {
+            "requested_topic": str(query_plan.get("primary_topic") or ""),
+            "retrieved_count": int(topic_guard.get("retrieved_count") or 0),
+            "kept_after_topic_filter": int(topic_guard.get("kept_after_topic_filter") or 0),
+            "dropped_wrong_topic": int(topic_guard.get("dropped_wrong_topic") or 0),
+            "dropped_deny_keyword": int(topic_guard.get("dropped_deny_keyword") or 0),
+            "reason": str(topic_guard.get("reason") or ""),
+            "violations": list(topic_guard.get("violations") or []),
+            "dropped_chunks": list(topic_guard.get("dropped_chunks") or [])[:10],
+        },
+    }
+
+
+def _normalized_rerank_trace(rerank_trace: list[dict[str, Any]], results: list[dict[str, Any]]) -> dict[str, Any]:
+    top_results = list(rerank_trace or _rerank_debug_entries(results[:10]))[:10]
+    return {
+        "input_count": len(results),
+        "output_count": len(results),
+        "top_results": top_results,
+        "lost_relevant_results": [],
+        "score_breakdown_available": any(isinstance(item.get("score_breakdown"), dict) for item in top_results),
+    }
+
+
+def _normalized_prompt_trace(
+    prompt: str,
+    sources: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    settings: LocalAiSettings,
+) -> dict[str, Any]:
+    prompt_debug = _prompt_debug(prompt, settings)
+    context_char_count = int(prompt_debug.get("context_chars") or 0)
+    return {
+        "context_count": len(results),
+        "source_count": len(sources),
+        "context_char_count": context_char_count,
+        "truncated": bool(context_char_count and context_char_count >= settings.prompt_max_context_chars),
+        "prompt_debug": prompt_debug,
+        **prompt_debug,
+    }
+
+
+_REQUIRED_TOPICS = (
+    "tech_ai_internet",
+    "economy_finance_stock",
+    "politics_society",
+    "world_geopolitics",
+    "business_startup",
+    "real_estate",
+    "lifestyle_education_health_entertainment",
+)
+
+
+def _router_reason(query_plan: dict[str, Any]) -> str:
+    topic = str(query_plan.get("primary_topic") or "")
+    if not topic:
+        return "no domain topic selected"
+    if bool(query_plan.get("explicit_topic")):
+        return f"explicit topic/domain keyword selected {topic}"
+    matched = query_plan.get("matched_keywords")
+    if isinstance(matched, list) and matched:
+        return f"highest topic score for {topic}; matched keywords: {', '.join(str(item) for item in matched)}"
+    return f"highest topic score or taxonomy fallback selected {topic}"
+
+
+def _context_builder_debug(
+    results: list[dict[str, Any]],
+    sources: list[dict[str, Any]],
+    prompt: str,
+    settings: LocalAiSettings,
+    retrieved_articles: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    articles = retrieved_articles or []
+    titles = [str(source.get("title") or "") for source in sources if str(source.get("title") or "").strip()]
+    topics = sorted({str(source.get("topic") or source.get("primary_topic") or "") for source in sources if str(source.get("topic") or source.get("primary_topic") or "").strip()})
+    return {
+        "final_chunk_count": len(results),
+        "final_article_count": len(articles) if articles else len(sources),
+        "context_chars": _context_chars_from_prompt(prompt),
+        "max_context_chars": settings.prompt_max_context_chars,
+        "titles_in_context": titles,
+        "topics_in_context": topics,
+        "whether_context_empty": not bool(results or sources),
+    }
+
+
+def _prompt_debug(prompt: str, settings: LocalAiSettings) -> dict[str, Any]:
+    limit = max(0, int(settings.prompt_debug_max_chars or 0))
+    preview = prompt[:limit] if limit else ""
+    return {
+        "prompt_chars": len(prompt),
+        "context_chars": _context_chars_from_prompt(prompt),
+        "prompt_preview": preview,
+        "no_answer_rules": [
+            "Return NO_INFO_FALLBACK only when context is empty, unrelated, or insufficient.",
+            "If context has direct evidence/title keyword overlap, answer from context with citations.",
+        ],
+    }
+
+
+def _context_chars_from_prompt(prompt: str) -> int:
+    if not prompt:
+        return 0
+    markers = ("RETRIEVED_CONTEXT:", "CONTEXT:", "ARTICLE_CONTEXT:")
+    for marker in markers:
+        start = prompt.find(marker)
+        if start < 0:
+            continue
+        tail = prompt[start + len(marker) :]
+        end_positions = [pos for token in ("\n\nUSER_QUESTION:", "\n\nCAU HOI:", "\n\nCÂU HỎI:") if (pos := tail.find(token)) >= 0]
+        end = min(end_positions) if end_positions else len(tail)
+        return len(tail[:end].strip())
+    return 0
+
+
+def _rerank_debug_entries(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for result in results:
+        entry = {
+            "title": str(_result_metadata(result).get("title") or ""),
+            "source": str(_result_metadata(result).get("source") or ""),
+            "topic": str(_result_metadata(result).get("primary_topic") or _result_metadata(result).get("topic") or ""),
+            "published_at": str(_result_metadata(result).get("published_at") or ""),
+            "article_id": str(_result_metadata(result).get("article_id") or ""),
+            "vector_score": safe_float(result.get("vector_score") or result.get("score")),
+            "keyword_score": safe_float(result.get("keyword_score")),
+            "topic_score": safe_float(result.get("combined_topic_score") or result.get("topic_match")),
+            "topic_penalty": safe_float(result.get("topic_penalty")),
+            "recency_score": safe_float(result.get("recency_score")),
+            "entity_score": safe_float(result.get("combined_entity_score") or result.get("entity_match")),
+            "final_score": safe_float(result.get("final_score") or result.get("score")),
+            "matched_keywords": result.get("matched_keywords", []),
+            "why_selected": "penalized: topic mismatch" if safe_float(result.get("topic_penalty")) > 0 else "selected",
+        }
+        if isinstance(result.get("score_breakdown"), dict):
+            entry["score_breakdown"] = result["score_breakdown"]
+        entries.append(entry)
+    return entries
+
+
+def _source_diversity_count_from_results(results: list[dict[str, Any]]) -> int:
+    return len({str(_result_metadata(result).get("source") or "") for result in results if str(_result_metadata(result).get("source") or "").strip()})
+
+
+def _ollama_model(client: Any) -> str:
+    if client is None:
+        return ""
+    runtime_config = getattr(client, "runtime_config", None)
+    if callable(runtime_config):
+        try:
+            config = runtime_config()
+            if isinstance(config, dict):
+                return str(config.get("model") or "")
+        except Exception:
+            return ""
+    return str(getattr(client, "_model", "") or "")
+
+
+def _env_flag(name: str) -> bool:
+    value = os.getenv(name)
+    return bool(value and value.strip().lower() in {"1", "true", "yes", "y", "on"})
 
 
 def extractive_answer(question: str, results: list[dict[str, object]]) -> str:
@@ -722,6 +1920,420 @@ def merge_chunk_texts(chunks: list[dict[str, object]]) -> str:
     return " ".join(texts)
 
 
+def build_related_articles(parent_articles: list[dict[str, Any]], sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_id = {str(parent.get("article_id") or ""): parent for parent in parent_articles}
+    related: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for source in sources:
+        article_id = str(source.get("article_id") or "")
+        if not article_id or article_id in seen:
+            continue
+        seen.add(article_id)
+        parent = by_id.get(article_id, {})
+        related.append(
+            {
+                "article_id": article_id,
+                "title": str(parent.get("title") or source.get("title") or ""),
+                "url": str(parent.get("url") or source.get("url") or ""),
+                "source": str(parent.get("source") or source.get("source") or ""),
+                "published_at": str(parent.get("published_at") or source.get("published_at") or ""),
+                "primary_topic": str(parent.get("primary_topic") or source.get("primary_topic") or ""),
+            }
+        )
+    return related
+
+
+def build_generated_image_prompts(
+    sources: list[dict[str, Any]],
+    images: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    article_ids_with_images = {
+        str(image.get("article_id") or "")
+        for image in images
+        if str(image.get("article_id") or "").strip() and str(image.get("image_url") or image.get("url") or "").strip()
+    }
+    prompts: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for source in sources:
+        article_id = str(source.get("article_id") or "").strip()
+        if not article_id or article_id in seen or article_id in article_ids_with_images:
+            continue
+        seen.add(article_id)
+        title = str(source.get("title") or "").strip()
+        snippet = str(source.get("snippet") or "").strip()
+        source_name = str(source.get("source") or source.get("source_name") or "").strip()
+        prompt = _image_generation_prompt_for_source(title=title, snippet=snippet, source_name=source_name)
+        prompts.append(
+            {
+                "article_id": article_id,
+                "article_title": title,
+                "source": source_name,
+                "prompt": prompt,
+                "image_generation_prompt": prompt,
+            }
+        )
+    return prompts
+
+
+def _image_generation_prompt_for_source(title: str, snippet: str, source_name: str) -> str:
+    subject = _prompt_subject(title, snippet)
+    source_hint = f" Inspired by a Vietnamese news article from {source_name}." if source_name else ""
+    return (
+        "Create a neutral editorial illustration for a news article, not a real photo. "
+        f"Main subject: {subject}. "
+        "Use a realistic but clearly illustrative newsroom style, balanced lighting, no sensationalism. "
+        "Do not add logos, brand marks, public figures, private individuals, company products, stock tickers, or exact documents "
+        "unless they are explicitly named in the subject. "
+        "Avoid text overlays and avoid implying the image is documentary evidence."
+        f"{source_hint}"
+    )
+
+
+def _prompt_subject(title: str, snippet: str, max_chars: int = 260) -> str:
+    text = " ".join((title or snippet or "general news topic").split())
+    if snippet and title:
+        text = f"{title}. Context: {' '.join(snippet.split())}"
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars].rstrip()}..."
+
+
+def _has_sufficient_evidence(results: list[dict[str, Any]]) -> bool:
+    if not results:
+        return False
+    best = max(
+        max(safe_float(result.get("final_score")), safe_float(result.get("score")), safe_float(result.get("vector_score")))
+        for result in results
+    )
+    best_vector = max(max(safe_float(result.get("score")), safe_float(result.get("vector_score"))) for result in results)
+    return best_vector >= 0.05 and best >= 0.15
+
+
+def _invalid_generated_answer_reason(answer: str | None, sources: list[dict[str, Any]]) -> str:
+    if not answer or not str(answer).strip():
+        return "empty_llm_answer"
+    if not sources:
+        return ""
+    normalized = normalize_text(str(answer))
+    evasive_markers = (
+        "cau hoi khong duoc chi ro",
+        "cau hoi chua duoc chi ro",
+        "khong cung cap cu the",
+        "khong duoc cung cap cu the",
+        "vui long cung cap them",
+        "xin vui long cung cap them",
+        "doan van ban cung cap",
+        "doan van duoc cung cap",
+        "noi dung da duoc chia se",
+        "khach hang yeu cau",
+        "khong ro lieu co lien quan",
+        "chua ro ban dang hoi",
+    )
+    if any(marker in normalized for marker in evasive_markers):
+        return "llm_evasive_despite_retrieved_sources"
+    source_titles = [normalize_text(str(source.get("title") or "")) for source in sources]
+    if source_titles and not any(_title_token_overlap(normalized, title) for title in source_titles):
+        if len(normalized) < 180 and any(term in normalized for term in ("khong tim thay", "khong co thong tin", "chua co thong tin")):
+            return "llm_no_answer_despite_retrieved_sources"
+    return ""
+
+
+def _title_token_overlap(normalized_answer: str, normalized_title: str) -> bool:
+    title_terms = {term for term in normalized_title.split() if len(term) >= 3}
+    if not title_terms:
+        return False
+    answer_terms = {term for term in normalized_answer.split() if len(term) >= 3}
+    return len(title_terms.intersection(answer_terms)) >= min(2, len(title_terms))
+
+
+def _select_latest_article_results(results: list[dict[str, Any]], article_count: int) -> list[dict[str, Any]]:
+    if not results:
+        return []
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    fallback_index = 0
+    for result in results:
+        metadata = result.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        article_id = str(metadata.get("article_id") or "")
+        if not article_id:
+            fallback_index += 1
+            article_id = str(metadata.get("url") or result.get("chunk_id") or f"fallback:{fallback_index}")
+        grouped[article_id].append(result)
+
+    ordered_article_ids = sorted(
+        grouped,
+        key=lambda article_id: (
+            max(parse_published_at(str(_result_metadata(item).get("published_at") or "")) for item in grouped[article_id]),
+            max(safe_float(item.get("final_score") or item.get("score")) for item in grouped[article_id]),
+        ),
+        reverse=True,
+    )[: max(1, int(article_count))]
+
+    selected: list[dict[str, Any]] = []
+    for article_id in ordered_article_ids:
+        chunks = sorted(
+            grouped[article_id],
+            key=lambda item: (
+                -chunk_index_of(item),
+                safe_float(item.get("final_score") or item.get("score")),
+            ),
+            reverse=True,
+        )
+        selected.extend(chunks[:2])
+    return selected
+
+
+def _result_metadata(result: dict[str, Any]) -> dict[str, Any]:
+    metadata = result.get("metadata", {})
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _extract_citation_number(normalized_question: str) -> int | None:
+    patterns = (
+        r"\[(\d{1,2})\]",
+        r"(?:nguon|source)\s*(?:so)?\s*(\d{1,2})",
+        r"(?:bai\s+bao|article)\s*(?:so)?\s*(\d{1,2})",
+        r"(?:bai|tin)\s*(?:so)?\s*(\d{1,2})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized_question)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _has_context_reference(normalized_question: str) -> bool:
+    references = (
+        "bai nay",
+        "bai do",
+        "bai bao nay",
+        "bai bao do",
+        "tin nay",
+        "tin do",
+        "nguon nay",
+        "nguon do",
+        "y tren",
+        "doan tren",
+    )
+    return any(reference in normalized_question for reference in references)
+
+
+def _context_sources(current_context: dict[str, Any]) -> list[dict[str, Any]]:
+    sources = current_context.get("previous_sources")
+    if not isinstance(sources, list):
+        return []
+    return [dict(source) for source in sources if isinstance(source, dict)]
+
+
+def _context_topic(current_context: dict[str, Any]) -> str:
+    explicit_topic = str(current_context.get("previous_topic") or current_context.get("topic") or "").strip()
+    if explicit_topic:
+        return explicit_topic
+    query_plan = current_context.get("previous_query_plan")
+    if isinstance(query_plan, dict):
+        topic = str(query_plan.get("primary_topic") or query_plan.get("topic") or "").strip()
+        if topic:
+            return topic
+    sources = _context_sources(current_context)
+    if sources:
+        return str(sources[0].get("topic") or sources[0].get("primary_topic") or "")
+    return ""
+
+
+def _resolve_followup_route(
+    question: str,
+    query_plan: dict[str, Any],
+    current_context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if query_plan.get("answer_mode") != "followup":
+        return query_plan
+    updated = dict(query_plan)
+    if not current_context:
+        updated.update(
+            {
+                "needs_clarification": True,
+                "clarification_message": "Mình chưa có ngữ cảnh trước đó để hiểu 'vụ này' là vụ nào. Bạn hãy nhắc lại chủ đề hoặc chọn một nguồn cụ thể.",
+                "standalone_query": "",
+            }
+        )
+        return updated
+
+    previous_plan = current_context.get("previous_query_plan")
+    previous_plan = previous_plan if isinstance(previous_plan, dict) else {}
+    topic = _context_topic(current_context)
+    sources = _context_sources(current_context)
+    entities = _context_list(previous_plan, "entities")
+    stock_symbols = _context_list(previous_plan, "stock_symbols")
+    if not entities and sources:
+        entities = _entities_from_sources(sources)
+    if not topic and not entities and not stock_symbols:
+        updated.update(
+            {
+                "needs_clarification": True,
+                "clarification_message": "Mình chưa xác định được bạn đang hỏi tiếp về chủ đề nào. Bạn hãy nhắc lại chủ đề hoặc nguồn cần hỏi.",
+                "standalone_query": "",
+            }
+        )
+        return updated
+
+    updated["primary_topic"] = topic or updated.get("primary_topic")
+    updated["domain"] = domain_from_topic(str(updated.get("primary_topic") or "") or None)
+    updated["entities"] = entities
+    updated["stock_symbols"] = stock_symbols
+    updated["ticker"] = stock_symbols[0] if stock_symbols else str(previous_plan.get("ticker") or "")
+    updated["exact_entities"] = [*entities, *stock_symbols]
+    updated["lexical_terms"] = [*entities, *stock_symbols]
+    updated["requires_lexical"] = bool(entities or stock_symbols)
+    updated["time_range"] = str(previous_plan.get("time_range") or updated.get("time_range") or "all")
+    updated["needs_recent"] = bool(previous_plan.get("needs_recent") or updated.get("needs_recent"))
+    updated["preferred_sources"] = list(previous_plan.get("preferred_sources") or updated.get("preferred_sources") or [])
+    updated["topic_confidence"] = max(float(updated.get("topic_confidence") or 0.0), float(previous_plan.get("topic_confidence") or 0.0), 0.8 if topic else 0.0)
+    updated["topic_confidence_label"] = "high" if topic else str(updated.get("topic_confidence_label") or "")
+    updated["explicit_topic"] = bool(topic or updated.get("explicit_topic"))
+    updated["data_source"] = "article_rag"
+    updated["standalone_query"] = _standalone_followup_query(question, updated, previous_plan)
+    updated["followup_inherited_from_context"] = True
+    return updated
+
+
+def _context_list(plan: dict[str, Any], key: str) -> list[str]:
+    values = plan.get(key)
+    if not isinstance(values, list):
+        return []
+    output: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        output.append(item)
+    return output
+
+
+def _entities_from_sources(sources: list[dict[str, Any]]) -> list[str]:
+    values: list[str] = []
+    for source in sources:
+        for key in ("title", "source"):
+            value = str(source.get(key) or "").strip()
+            if value:
+                values.append(value)
+    return values[:3]
+
+
+def _standalone_followup_query(question: str, query_plan: dict[str, Any], previous_plan: dict[str, Any]) -> str:
+    topic = str(query_plan.get("primary_topic") or "")
+    entities = [str(item) for item in query_plan.get("entities", []) if str(item).strip()]
+    stock_symbols = [str(item) for item in query_plan.get("stock_symbols", []) if str(item).strip()]
+    previous_query = str(previous_plan.get("normalized_query") or previous_plan.get("standalone_query") or "").strip()
+    if topic == "tech_ai_internet":
+        base = "phan tich anh huong cua cac tin AI gan day"
+    elif topic == "economy_finance_stock":
+        target = ", ".join(stock_symbols or entities) or "thi truong tai chinh chung khoan"
+        base = f"phan tich anh huong den {target}"
+    elif topic == "real_estate":
+        base = "phan tich anh huong cua cac tin bat dong san gan day"
+    elif topic == "world_geopolitics":
+        base = "phan tich tac dong cua dien bien quoc te gan day"
+    elif topic == "business_startup":
+        base = "phan tich tac dong cua tin doanh nghiep startup gan day"
+    elif topic == "politics_society":
+        base = "phan tich tac dong xa hoi cua su kien thoi su gan day"
+    elif topic == "lifestyle_education_health_entertainment":
+        base = "phan tich tac dong cua tin doi song giao duc suc khoe giai tri gan day"
+    else:
+        base = previous_query or normalize_text(question)
+    if previous_query and previous_query not in base:
+        return f"{base}; ngu canh truoc: {previous_query}"
+    return base
+
+
+def _followup_query_plan(followup_intent: str, current_context: dict[str, Any]) -> dict[str, Any]:
+    topic = _context_topic(current_context)
+    previous_plan = current_context.get("previous_query_plan")
+    previous_plan = previous_plan if isinstance(previous_plan, dict) else {}
+    entities = _context_list(previous_plan, "entities")
+    stock_symbols = _context_list(previous_plan, "stock_symbols")
+    return {
+        "intent": followup_intent,
+        "answer_mode": "followup",
+        "primary_topic": topic or None,
+        "domain": domain_from_topic(topic or None),
+        "ticker": stock_symbols[0] if stock_symbols else str(previous_plan.get("ticker") or ""),
+        "entities": entities,
+        "stock_symbols": stock_symbols,
+        "requires_lexical": bool(entities or stock_symbols),
+        "lexical_terms": [*entities, *stock_symbols],
+        "exact_entities": [*entities, *stock_symbols],
+        "needs_recent": False,
+        "needs_images": followup_intent == "followup_media_lookup",
+        "preferred_sources": [],
+        "time_range": str(previous_plan.get("time_range") or "all"),
+        "source": None,
+        "need_images": followup_intent == "followup_media_lookup",
+        "need_sources": True,
+        "need_timeline": False,
+        "data_source": "current_context",
+        "standalone_query": _standalone_followup_query("", {"primary_topic": topic, "entities": entities, "stock_symbols": stock_symbols}, previous_plan),
+    }
+
+
+def _source_context_to_source(source: dict[str, Any]) -> dict[str, Any]:
+    topic = str(source.get("topic") or source.get("primary_topic") or "")
+    return {
+        "citation_id": source.get("citation_id"),
+        "article_id": str(source.get("article_id") or ""),
+        "title": str(source.get("title") or ""),
+        "source": str(source.get("source") or ""),
+        "url": str(source.get("url") or ""),
+        "published_at": str(source.get("published_at") or ""),
+        "primary_topic": topic,
+        "topic": topic,
+        "domain": domain_from_topic(topic),
+        "score": safe_float(source.get("score")),
+        "snippet": str(source.get("snippet") or ""),
+    }
+
+
+def _context_images_for_source(current_context: dict[str, Any], source: dict[str, Any]) -> list[dict[str, Any]]:
+    images = current_context.get("previous_images")
+    if not isinstance(images, list):
+        return []
+    article_id = str(source.get("article_id") or "")
+    title = str(source.get("title") or "")
+    output: list[dict[str, Any]] = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        image_article_id = str(image.get("article_id") or "")
+        image_title = str(image.get("article_title") or "")
+        if article_id and image_article_id and article_id != image_article_id:
+            continue
+        if not article_id and title and image_title and title != image_title:
+            continue
+        normalized = dict(image)
+        if normalized.get("image_url") and not normalized.get("url"):
+            normalized["url"] = normalized["image_url"]
+        if normalized.get("url") and not normalized.get("image_url"):
+            normalized["image_url"] = normalized["url"]
+        output.append(normalized)
+    return output
+
+
+def _clarification_response(question: str, message: str, query_plan: dict[str, Any]) -> dict[str, object]:
+    return {
+        "question": question,
+        "answer": message,
+        "intent": query_plan.get("intent", "followup_clarification"),
+        "topic": query_plan.get("primary_topic"),
+        "query_plan": query_plan,
+        "sources": [],
+        "images": [],
+        "related_articles": [],
+    }
+
+
 def split_sentences(text: str) -> list[str]:
     normalized = " ".join(text.split())
     if not normalized:
@@ -741,6 +2353,27 @@ def extract_title_hint(question: str) -> str | None:
     quoted = re.findall(r'"([^"]+)"', normalized)
     if quoted:
         return quoted[0].strip()
+    suffix_markers = (
+        " tóm tắt",
+        " tom tat",
+        " hãy tóm tắt",
+        " hay tom tat",
+    )
+    lowered = normalized.casefold()
+    for marker in suffix_markers:
+        index = lowered.find(marker)
+        if index > 0:
+            return normalized[:index].strip(" -:;,.") or None
+    prefix_patterns = (
+        r"^\s*(?:hãy\s+)?tóm\s+tắt\s+(?:bài\s+báo|bài|tin|nội\s+dung)?\s*(?:này|sau)?\s*:?\s*(.+)$",
+        r"^\s*(?:hay\s+)?tom\s+tat\s+(?:bai\s+bao|bai|tin|noi\s+dung)?\s*(?:nay|sau)?\s*:?\s*(.+)$",
+        r"^\s*bài\s+(?:báo\s+)?có\s+tiêu\s+đề\s+(.+)$",
+        r"^\s*bai\s+(?:bao\s+)?co\s+tieu\s+de\s+(.+)$",
+    )
+    for pattern in prefix_patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" -:;,.") or None
     return None
 
 
@@ -769,3 +2402,4 @@ def parse_published_at(value: str) -> datetime:
         return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return datetime.min
+

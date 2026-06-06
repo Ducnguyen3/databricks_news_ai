@@ -6,8 +6,8 @@ from dataclasses import asdict
 from typing import Any
 
 from app.config import TableNames
-from app.databricks.delta_tables import articles_clean_schema, news_articles_schema
-from app.domain.models import Article
+from app.databricks.delta_tables import article_images_schema, articles_clean_schema, news_articles_schema
+from app.domain.models import Article, ArticleImage
 from app.repositories.raw_document_repository import RawDocumentRepository, RawDocumentsRepository
 
 logger = logging.getLogger(__name__)
@@ -57,13 +57,20 @@ class ArticlesCleanRepository:
                 summary_raw,
                 content,
                 category,
+                source_category_name,
+                source_category_url,
                 published_at,
                 crawled_at,
                 content_hash,
                 dedup_group_id,
                 is_duplicate,
                 created_at,
-                updated_at
+                updated_at,
+                COALESCE(primary_topic, 'general_news') AS primary_topic,
+                COALESCE(primary_topic_name, 'Tin tổng hợp') AS primary_topic_name,
+                COALESCE(topic_confidence, 0.0) AS topic_confidence,
+                COALESCE(secondary_topics_json, '[]') AS secondary_topics_json,
+                COALESCE(entities_json, '[]') AS entities_json
             FROM (
                 SELECT
                     *,
@@ -85,6 +92,32 @@ class ArticlesCleanRepository:
         )
         count = self._spark.table(self._tables.articles_clean_fqn).count()
         logger.info("Rebuilt %s with %s rows", self._tables.articles_clean_fqn, count)
+
+
+class ArticleImagesRepository:
+    def __init__(self, spark: Any, tables: TableNames) -> None:
+        self._spark = spark
+        self._tables = tables
+
+    def upsert(self, images: list[ArticleImage]) -> None:
+        if not images:
+            logger.info("No article images to write")
+            return
+        schema = article_images_schema()
+        rows = [asdict(image) for image in images]
+        updates = _records_to_dataframe(self._spark, rows, schema)
+        view_name = _temp_view_name("article_images_updates")
+        updates.createOrReplaceTempView(view_name)
+        self._spark.sql(
+            f"""
+            MERGE INTO {self._tables.article_images_fqn} AS target
+            USING {view_name} AS source
+            ON target.id = source.id
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+            """
+        )
+        logger.info("Upserted %s article images into %s", len(images), self._tables.article_images_fqn)
 
 
 def clean_article_rows(articles: list[Article]) -> list[dict[str, Any]]:

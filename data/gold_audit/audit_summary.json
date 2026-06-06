@@ -1,0 +1,50 @@
+{
+  "table": "main.news_ai.articles_clean",
+  "required_fields": [
+    "article_id",
+    "title",
+    "cleaned_content",
+    "source_name",
+    "topic",
+    "published_at"
+  ],
+  "started_at": "2026-06-05T15:00:53.906502+00:00",
+  "finished_at": "2026-06-05T15:01:31.024510+00:00",
+  "duration_seconds": 37.118,
+  "output_dir": "data\\gold_audit",
+  "valid_articles_path": "data\\gold_audit\\valid_articles.jsonl",
+  "invalid_articles_path": "data\\gold_audit\\invalid_articles.jsonl",
+  "summary_path": "data\\gold_audit\\audit_summary.json",
+  "total_articles": 17528,
+  "valid_articles": 17386,
+  "invalid_articles": 142,
+  "valid_ratio": 0.991899,
+  "reason_counts": {
+    "empty_field:published_at": 142
+  },
+  "missing_field_counts": {},
+  "empty_field_counts": {
+    "published_at": 142
+  },
+  "topic_counts": {
+    "business_startup": 881,
+    "economy_finance_stock": 2283,
+    "politics_society": 3150,
+    "real_estate": 1161,
+    "world_geopolitics": 1526,
+    "lifestyle_education_health_entertainment": 6464,
+    "general_news": 19,
+    "tech_ai_internet": 2044
+  },
+  "source_counts": {
+    "diendandoanhnghiep": 1672,
+    "genk": 688,
+    "cafef": 1849,
+    "vnexpress": 13319
+  },
+  "content_chars": {
+    "min": 121,
+    "max": 132936,
+    "avg": 3765.37
+  }
+}

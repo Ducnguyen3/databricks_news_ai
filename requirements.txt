@@ -1,2 +1,13 @@
 beautifulsoup4
 requests
+databricks-sql-connector
+fastapi
+pandas
+python-dotenv
+sentence-transformers
+chromadb
+requests
+pydantic
+torchvision
+scikit-learn
+uvicorn

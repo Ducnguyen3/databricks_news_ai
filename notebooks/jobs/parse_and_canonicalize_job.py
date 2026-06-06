@@ -2,7 +2,18 @@
 from __future__ import annotations
 
 import sys
+import subprocess
 from pathlib import Path
+
+
+def _ensure_runtime_dependencies() -> None:
+    missing_packages: list[str] = []
+    try:
+        import bs4  # noqa: F401
+    except ImportError:
+        missing_packages.append("beautifulsoup4")
+    if missing_packages:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", *missing_packages])
 
 
 def _add_project_root_to_python_path() -> None:
@@ -18,6 +29,7 @@ def _add_project_root_to_python_path() -> None:
             sys.path.insert(0, str(local_project_root))
 
 
+_ensure_runtime_dependencies()
 _add_project_root_to_python_path()
 
 from app.jobs.parse_and_canonicalize_job import main

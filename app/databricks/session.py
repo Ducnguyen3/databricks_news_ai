@@ -13,6 +13,6 @@ def get_spark() -> Any:
         raise RuntimeError("pyspark is required for Databricks pipeline jobs") from exc
 
     spark = SparkSession.getActiveSession() or SparkSession.builder.getOrCreate()
-    logger.info("Using Spark application: %s", spark.sparkContext.appName)
+    logger.info("Using active Spark session")
     return spark
 

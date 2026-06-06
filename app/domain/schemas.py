@@ -20,6 +20,11 @@ class ArticleRow(TypedDict, total=False):
     is_duplicate: bool
     created_at: Any
     updated_at: Any
+    primary_topic: str
+    primary_topic_name: str
+    topic_confidence: float
+    secondary_topics_json: str
+    entities_json: str
 
 
 @dataclass(frozen=True, slots=True)

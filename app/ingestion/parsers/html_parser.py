@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -12,6 +13,8 @@ from app.domain.models import Article
 from app.processing.canonicalizer import normalize_url
 from app.processing.cleaner import clean_text, strip_html_tags
 from app.processing.deduplicator import hash_content
+from app.processing.entity_extractor import extract_entities
+from app.processing.taxonomy import normalize_topic
 from app.utils.time import utc_now
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,34 @@ _COMMON_SELECTORS = (
     ".content-detail",
     ".detail-content",
     ".post-content",
+)
+
+_PUBLISHED_AT_SELECTORS = {
+    "vnexpress": (".date", ".time", ".article-date", "time"),
+    "genk": (".kbwcm-time", ".knc-date", ".detail-time", ".news-date", ".time", "time"),
+    "diendandoanhnghiep": (
+        ".detail-date",
+        ".article-date",
+        ".detail__time",
+        ".b-maincontent__time",
+        ".block-sc-publish-time",
+        ".sc-longform-header-date",
+        ".time-public",
+        ".date-public",
+        ".time",
+        ".date",
+        "time",
+    ),
+    "cafef": (".time", ".pdate", ".date", "time"),
+}
+
+_COMMON_PUBLISHED_AT_SELECTORS = (
+    "time",
+    ".date",
+    ".time",
+    ".article-date",
+    ".detail-date",
+    ".pdate",
 )
 
 
@@ -49,7 +80,28 @@ def parse_raw_document(raw_document: Mapping[str, Any]) -> Article | None:
 
     now = utc_now()
     content_hash = hash_content(content)
-    article_id = str(uuid.uuid5(uuid.NAMESPACE_URL, canonical_url or content_hash))
+    article_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"{source}|{canonical_url or content_hash}"))
+    category = clean_text(str(payload.get("category") or rss.get("category") or "")) or None
+    source_category_name = clean_text(str(payload.get("source_category_name") or payload.get("category_name") or "")) or None
+    source_category_url = normalize_url(str(payload.get("source_category_url") or payload.get("category_url") or ""))
+    topic = normalize_topic(
+        source=source,
+        source_category=category,
+        title=title,
+        summary=summary_raw,
+        content=content,
+    )
+    entity_result = extract_entities(
+        title=title,
+        summary=summary_raw,
+        content=content,
+        source_category=category,
+    )
+    published_at_raw = (
+        payload.get("published_at")
+        or rss.get("published_raw")
+        or _extract_published_at(html, source)
+    )
     return Article(
         article_id=article_id,
         source=source,
@@ -58,8 +110,10 @@ def parse_raw_document(raw_document: Mapping[str, Any]) -> Article | None:
         title=title,
         summary_raw=summary_raw,
         content=content,
-        category=clean_text(str(payload.get("category") or rss.get("category") or "")) or None,
-        published_at=parse_datetime(str(payload.get("published_at") or rss.get("published_raw") or "")),
+        category=category,
+        source_category_name=source_category_name,
+        source_category_url=source_category_url or None,
+        published_at=parse_datetime(str(published_at_raw or "")),
         crawled_at=_as_datetime(raw_document.get("fetched_at")) or now,
         content_hash=content_hash,
         dedup_group_id=article_id,
@@ -67,6 +121,11 @@ def parse_raw_document(raw_document: Mapping[str, Any]) -> Article | None:
         created_at=now,
         updated_at=now,
         raw_id=str(raw_document.get("raw_document_id") or raw_document.get("raw_id") or ""),
+        primary_topic=str(topic["primary_topic"]),
+        primary_topic_name=str(topic["primary_topic_name"]),
+        topic_confidence=float(topic["topic_confidence"]),
+        secondary_topics_json=json.dumps(topic["secondary_topics"], ensure_ascii=False),
+        entities_json=json.dumps(entity_result["entities"], ensure_ascii=False),
     )
 
 
@@ -76,16 +135,93 @@ def parse_datetime(value: str | None) -> datetime | None:
     text = value.strip()
     if not text:
         return None
-    try:
-        parsed = parsedate_to_datetime(text)
-    except (TypeError, ValueError):
-        try:
-            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
+    parsed = _parse_standard_datetime(text) or _parse_vietnamese_datetime(text)
+    if parsed is None:
+        return None
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
     return parsed
+
+
+def _parse_standard_datetime(text: str) -> datetime | None:
+    try:
+        return parsedate_to_datetime(text)
+    except (TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+
+def _parse_vietnamese_datetime(text: str) -> datetime | None:
+    normalized = clean_text(strip_html_tags(text))
+    if not normalized:
+        return None
+
+    timezone_offset = _timezone_offset(normalized)
+    separator = r"(?:\s|,|\||-|–|—|lúc|luc)+"
+    patterns = (
+        rf"(?P<day>\d{{1,2}})[/-](?P<month>\d{{1,2}})[/-](?P<year>\d{{4}}){separator}(?P<hour>\d{{1,2}}):(?P<minute>\d{{2}})(?::(?P<second>\d{{2}}))?\s*(?P<ampm>AM|PM|SA|CH)?",
+        rf"(?P<hour>\d{{1,2}}):(?P<minute>\d{{2}})(?::(?P<second>\d{{2}}))?\s*(?P<ampm>AM|PM|SA|CH)?{separator}(?P<day>\d{{1,2}})[/-](?P<month>\d{{1,2}})[/-](?P<year>\d{{4}})",
+        rf"(?P<month>\d{{1,2}})[/-](?P<day>\d{{1,2}})[/-](?P<year>\d{{4}}){separator}(?P<hour>\d{{1,2}}):(?P<minute>\d{{2}})(?::(?P<second>\d{{2}}))?\s*(?P<ampm>AM|PM)?",
+        rf"(?P<hour>\d{{1,2}}):(?P<minute>\d{{2}})(?::(?P<second>\d{{2}}))?\s*(?P<ampm>AM|PM)?{separator}(?P<month>\d{{1,2}})[/-](?P<day>\d{{1,2}})[/-](?P<year>\d{{4}})",
+        r"(?P<day>\d{1,2})[/-](?P<month>\d{1,2})[/-](?P<year>\d{4})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if not match:
+            continue
+        values = match.groupdict(default="0")
+        try:
+            parsed = datetime(
+                int(values["year"]),
+                int(values["month"]),
+                int(values["day"]),
+                _hour_24(int(values.get("hour") or 0), values.get("ampm") or ""),
+                int(values.get("minute") or 0),
+                int(values.get("second") or 0),
+            )
+        except ValueError:
+            continue
+        if timezone_offset is not None:
+            parsed = parsed.replace(tzinfo=timezone(timezone_offset))
+        return parsed
+    return None
+
+
+def _hour_24(hour: int, ampm: str) -> int:
+    marker = ampm.strip().casefold()
+    if marker in {"pm", "ch"} and hour < 12:
+        return hour + 12
+    if marker in {"am", "sa"} and hour == 12:
+        return 0
+    return hour
+
+
+def _extract_datetime_text(text: str) -> str:
+    normalized = clean_text(strip_html_tags(text))
+    if not normalized:
+        return ""
+    patterns = (
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{4}(?:\s|,|\||-|–|—|lúc|luc)+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|SA|CH)?(?:\s*\(?GMT\s*[+-]\s*\d{1,2}:?\d{0,2}\)?)?",
+        r"\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|SA|CH)?(?:\s|,|\||-|–|—|lúc|luc)+\d{1,2}[/-]\d{1,2}[/-]\d{4}(?:\s*\(?GMT\s*[+-]\s*\d{1,2}:?\d{0,2}\)?)?",
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{4}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def _timezone_offset(text: str) -> timedelta | None:
+    match = re.search(r"GMT\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?", text, re.IGNORECASE)
+    if not match:
+        return None
+    sign = 1 if match.group(1) == "+" else -1
+    hours = int(match.group(2))
+    minutes = int(match.group(3) or 0)
+    return sign * timedelta(hours=hours, minutes=minutes)
 
 
 def _read_payload(value: Any) -> dict[str, Any]:
@@ -106,6 +242,48 @@ def _extract_title(html: str) -> str:
     if soup is not None and soup.title is not None:
         return soup.title.get_text(" ", strip=True)
     return ""
+
+
+def _extract_published_at(html: str, source: str) -> str:
+    if not html:
+        return ""
+    soup = _soup(html)
+    if soup is None:
+        return ""
+
+    for attrs in (
+        {"property": "article:published_time"},
+        {"name": "article:published_time"},
+        {"property": "article:modified_time"},
+        {"name": "article:modified_time"},
+        {"name": "pubdate"},
+        {"name": "publishdate"},
+        {"name": "datePublished"},
+        {"name": "parsely-pub-date"},
+        {"name": "date"},
+        {"itemprop": "datePublished"},
+        {"itemprop": "dateModified"},
+    ):
+        node = soup.find("meta", attrs=attrs)
+        if node is not None:
+            value = clean_text(str(node.get("content") or ""))
+            if value:
+                return value
+
+    for node in soup.select("time[datetime], time[content]"):
+        value = clean_text(str(node.get("datetime") or node.get("content") or ""))
+        if value:
+            return value
+
+    selectors = _PUBLISHED_AT_SELECTORS.get(source, ()) + _COMMON_PUBLISHED_AT_SELECTORS
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if node is None:
+            continue
+        value = clean_text(str(node.get("datetime") or node.get("content") or node.get_text(" ", strip=True) or ""))
+        if value:
+            return value
+    return _extract_datetime_text(soup.get_text(" ", strip=True))
 
 
 def _extract_content(html: str, source: str) -> str:

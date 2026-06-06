@@ -1,1 +1,1 @@
-"""Local embedding, vector store, Ollama client, Streamlit UI, and RAG chatbot components."""
+"""Local embedding, vector store, Ollama client, and RAG chatbot components."""

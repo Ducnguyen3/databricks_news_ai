@@ -1,0 +1,55 @@
+[
+  {
+    "id": "latest_ai_news",
+    "query": "tin AI moi nhat",
+    "expected_intent": "latest_news",
+    "expected_topic_contains": ["ai", "technology", "cong_nghe", "tech"],
+    "min_sources": 2,
+    "requires_images": false,
+    "requires_recent": true,
+    "requires_multi_source": true
+  },
+  {
+    "id": "world_today",
+    "query": "tinh hinh the gioi hom nay",
+    "expected_intent": "latest_news",
+    "expected_topic_contains": ["world", "quoc_te", "geopolitics"],
+    "min_sources": 2,
+    "requires_images": false,
+    "requires_recent": true,
+    "requires_multi_source": true
+  },
+  {
+    "id": "hpg_news",
+    "query": "HPG co gi moi",
+    "expected_intent": "entity_news",
+    "expected_entities": ["HPG", "Hoa Phat"],
+    "expected_topic_contains": ["finance", "stock", "kinh_te", "chung_khoan"],
+    "min_sources": 1,
+    "requires_images": false,
+    "requires_recent": true
+  },
+  {
+    "id": "ukraine_images",
+    "query": "cho toi cac bai co anh ve Ukraine",
+    "expected_intent": "media_lookup",
+    "expected_entities": ["Ukraine"],
+    "requires_images": true,
+    "min_images": 1,
+    "min_sources": 1
+  },
+  {
+    "id": "cafef_stock_news",
+    "query": "tin tu CafeF ve chung khoan",
+    "expected_source": "cafef",
+    "expected_topic_contains": ["finance", "stock", "chung_khoan", "kinh_te"],
+    "min_sources": 1
+  },
+  {
+    "id": "business_multi_source",
+    "query": "tong hop tin doanh nghiep moi nhat tu nhieu nguon",
+    "expected_topic_contains": ["business", "doanh_nghiep"],
+    "min_sources": 2,
+    "requires_multi_source": true
+  }
+]

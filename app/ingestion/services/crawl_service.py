@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+from threading import Lock
 from typing import Iterable
 
 from app.config import CrawlSettings
@@ -136,13 +138,27 @@ class CrawlService:
         stop_after_duplicate_pages = max(1, self._settings.stop_after_duplicate_pages)
 
         for category in categories:
-            logger.info("[CRAWL] Start category source=%s category=%s url=%s", crawler.source_name, category.name, category.url)
+            logger.info(
+                "[CRAWL] Start category source=%s category=%s max_pages=%s url=%s",
+                crawler.source_name,
+                category.name,
+                max_pages,
+                category.url,
+            )
             empty_page_count = 0
             duplicate_page_count = 0
 
             for page in range(1, max_pages + 1):
                 try:
                     category_page_url = crawler.build_category_page_url(category.url, page)
+                    if not category_page_url:
+                        logger.info(
+                            "[CRAWL] Stop category reason=no_next_page source=%s category=%s page=%s",
+                            crawler.source_name,
+                            category.name,
+                            page,
+                        )
+                        break
                     logger.info(
                         "[CRAWL] Page source=%s category=%s page=%s url=%s",
                         crawler.source_name,
@@ -241,20 +257,125 @@ class CrawlService:
         article_links: list[str],
         crawl_run_id: str,
     ) -> list[RawDocument]:
+        max_workers = max(1, int(getattr(self._settings, "max_concurrent_requests", 1)))
+        if max_workers <= 1 or len(article_links) <= 1:
+            return self._crawl_page_articles_sequential(
+                crawler=crawler,
+                category=category,
+                page=page,
+                article_links=article_links,
+                crawl_run_id=crawl_run_id,
+            )
+
+        logger.info(
+            "[CRAWL] Fetch page articles in parallel source=%s category=%s page=%s links=%s workers=%s",
+            crawler.source_name,
+            category.name,
+            page,
+            len(article_links),
+            max_workers,
+        )
+        lock = Lock()
+        indexed_documents: list[tuple[int, RawDocument]] = []
+        with ThreadPoolExecutor(max_workers=min(max_workers, len(article_links))) as executor:
+            futures = {
+                executor.submit(
+                    self._crawl_single_article,
+                    crawler,
+                    category,
+                    page,
+                    article_url,
+                    crawl_run_id,
+                    lock,
+                ): index
+                for index, article_url in enumerate(article_links)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    document = future.result()
+                except Exception as exc:
+                    logger.exception(
+                        "[CRAWL] Failed article source=%s category=%s page=%s url=%s error=%s",
+                        crawler.source_name,
+                        category.name,
+                        page,
+                        article_links[index],
+                        exc,
+                    )
+                    continue
+                if document is not None:
+                    indexed_documents.append((index, document))
+
+        indexed_documents.sort(key=lambda item: item[0])
+        return [document for _index, document in indexed_documents]
+
+    def _crawl_page_articles_sequential(
+        self,
+        crawler: BaseCrawler,
+        category: Category,
+        page: int,
+        article_links: list[str],
+        crawl_run_id: str,
+    ) -> list[RawDocument]:
         documents: list[RawDocument] = []
         for article_url in article_links:
-            crawler.request_delay()
-            article = crawler.crawl_article_detail(article_url, category=category, category_page=page)
-            if article is None:
-                continue
-            content_hash = article.content_hash or crawler.build_checksum(article)
-            if crawler.should_skip_content_hash(content_hash):
-                logger.info("[CRAWL] Skip duplicate content source=%s url=%s", crawler.source_name, article.url)
-                continue
-            document = crawler.build_raw_document(article=article, crawl_run_id=crawl_run_id)
-            crawler.mark_existing_link(document.url, document.canonical_url)
-            documents.append(document)
+            document = self._crawl_single_article(
+                crawler=crawler,
+                category=category,
+                page=page,
+                article_url=article_url,
+                crawl_run_id=crawl_run_id,
+                lock=None,
+            )
+            if document is not None:
+                documents.append(document)
         return documents
+
+    def _crawl_single_article(
+        self,
+        crawler: BaseCrawler,
+        category: Category,
+        page: int,
+        article_url: str,
+        crawl_run_id: str,
+        lock: Lock | None,
+    ) -> RawDocument | None:
+        crawler.request_delay()
+        article = crawler.crawl_article_detail(article_url, category=category, category_page=page)
+        if article is None:
+            return None
+        content_hash = article.content_hash or crawler.build_checksum(article)
+        if lock is None:
+            if crawler.should_skip_exact_existing_document(article.canonical_url, content_hash):
+                self._log_exact_duplicate(crawler, article.canonical_url)
+                return None
+            document = crawler.build_raw_document(article=article, crawl_run_id=crawl_run_id)
+            crawler.mark_seen_document(document.canonical_url, document.checksum)
+            crawler.mark_existing_link(document.url, document.canonical_url)
+        else:
+            with lock:
+                if crawler.should_skip_exact_existing_document(article.canonical_url, content_hash):
+                    self._log_exact_duplicate(crawler, article.canonical_url)
+                    return None
+                document = crawler.build_raw_document(article=article, crawl_run_id=crawl_run_id)
+                crawler.mark_seen_document(document.canonical_url, document.checksum)
+                crawler.mark_existing_link(document.url, document.canonical_url)
+        logger.info(
+            "[CRAWL] Saved raw document source=%s source_category=%s url=%s",
+            crawler.source_name,
+            article.category,
+            document.url,
+        )
+        return document
+
+    @staticmethod
+    def _log_exact_duplicate(crawler: BaseCrawler, canonical_url: str) -> None:
+        logger.info(
+            "[CRAWL] Skip exact duplicate: same source + same canonical_url + same checksum source=%s canonical_url=%s",
+            crawler.source_name,
+            canonical_url,
+        )
 
     def _load_existing_keys(self, crawler: BaseCrawler, source_name: str) -> None:
         if self._raw_document_repository is None:
@@ -268,6 +389,7 @@ class CrawlService:
         crawler.set_existing_keys(
             link_keys=getattr(existing_keys, "link_keys", set()),
             content_hashes=getattr(existing_keys, "content_hashes", set()),
+            exact_document_keys=getattr(existing_keys, "exact_document_keys", set()),
         )
 
 

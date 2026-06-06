@@ -46,6 +46,11 @@ def main(argv: Sequence[str] | None = None) -> CrawlResult:
         "request_delay_seconds",
         settings.crawl.request_delay_seconds,
     )
+    max_concurrent_requests = _int_arg_or_widget(
+        args.max_concurrent_requests,
+        "max_concurrent_requests",
+        settings.crawl.max_concurrent_requests,
+    )
     discover_categories_value = args.discover_categories
     if discover_categories_value is None:
         discover_categories_value = _read_databricks_widget("discover_categories", "")
@@ -63,6 +68,7 @@ def main(argv: Sequence[str] | None = None) -> CrawlResult:
         stop_after_empty_pages=stop_after_empty_pages,
         stop_after_duplicate_pages=stop_after_duplicate_pages,
         request_delay_seconds=request_delay_seconds,
+        max_concurrent_requests=max_concurrent_requests,
     )
 
     repository = None
@@ -96,6 +102,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--stop_after_empty_pages", type=int, default=None)
     parser.add_argument("--stop_after_duplicate_pages", type=int, default=None)
     parser.add_argument("--request_delay_seconds", type=float, default=None)
+    parser.add_argument("--max_concurrent_requests", type=int, default=None)
     parser.add_argument("--discover_categories", default=None)
     parser.add_argument("--crawl_mode", default=None)
     parser.add_argument("--crawl_run_id", default=None)

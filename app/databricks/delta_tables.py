@@ -30,7 +30,7 @@ def raw_documents_schema() -> Any:
 
 
 def news_articles_schema() -> Any:
-    from pyspark.sql.types import BooleanType, StringType, StructField, StructType, TimestampType
+    from pyspark.sql.types import StringType, StructField, StructType
 
     return StructType(
         [
@@ -41,7 +41,7 @@ def news_articles_schema() -> Any:
 
 
 def articles_clean_schema() -> Any:
-    from pyspark.sql.types import BooleanType, StringType, StructField, StructType, TimestampType
+    from pyspark.sql.types import BooleanType, DoubleType, StringType, StructField, StructType, TimestampType
 
     return StructType(
         [
@@ -53,6 +53,8 @@ def articles_clean_schema() -> Any:
             StructField("summary_raw", StringType(), True),
             StructField("content", StringType(), False),
             StructField("category", StringType(), True),
+            StructField("source_category_name", StringType(), True),
+            StructField("source_category_url", StringType(), True),
             StructField("published_at", TimestampType(), True),
             StructField("crawled_at", TimestampType(), False),
             StructField("content_hash", StringType(), False),
@@ -60,6 +62,34 @@ def articles_clean_schema() -> Any:
             StructField("is_duplicate", BooleanType(), False),
             StructField("created_at", TimestampType(), False),
             StructField("updated_at", TimestampType(), False),
+            StructField("primary_topic", StringType(), False),
+            StructField("primary_topic_name", StringType(), False),
+            StructField("topic_confidence", DoubleType(), False),
+            StructField("secondary_topics_json", StringType(), False),
+            StructField("entities_json", StringType(), False),
+        ]
+    )
+
+
+def article_images_schema() -> Any:
+    from pyspark.sql.types import BooleanType, IntegerType, StringType, StructField, StructType, TimestampType
+
+    return StructType(
+        [
+            StructField("id", StringType(), False),
+            StructField("article_id", StringType(), False),
+            StructField("source", StringType(), False),
+            StructField("canonical_url", StringType(), False),
+            StructField("image_url", StringType(), False),
+            StructField("caption", StringType(), True),
+            StructField("alt_text", StringType(), True),
+            StructField("credit", StringType(), True),
+            StructField("position", IntegerType(), False),
+            StructField("width", IntegerType(), True),
+            StructField("height", IntegerType(), True),
+            StructField("image_type", StringType(), False),
+            StructField("is_representative", BooleanType(), False),
+            StructField("created_at", TimestampType(), True),
         ]
     )
 
@@ -69,6 +99,8 @@ def ensure_database_objects(spark: Any, tables: TableNames) -> None:
     ensure_raw_documents_table(spark, tables)
     ensure_news_articles_table(spark, tables)
     ensure_articles_clean_table(spark, tables)
+    ensure_article_images_table(spark, tables)
+    ensure_sports_tables(spark, tables)
 
 
 def ensure_raw_documents_table(spark: Any, tables: TableNames) -> None:
@@ -109,16 +141,36 @@ def ensure_news_articles_table(spark: Any, tables: TableNames) -> None:
             summary_raw STRING,
             content STRING NOT NULL,
             category STRING,
+            source_category_name STRING,
+            source_category_url STRING,
             published_at TIMESTAMP,
             crawled_at TIMESTAMP NOT NULL,
             content_hash STRING NOT NULL,
             dedup_group_id STRING NOT NULL,
             is_duplicate BOOLEAN NOT NULL,
             created_at TIMESTAMP NOT NULL,
-            updated_at TIMESTAMP NOT NULL
+            updated_at TIMESTAMP NOT NULL,
+            primary_topic STRING NOT NULL,
+            primary_topic_name STRING NOT NULL,
+            topic_confidence DOUBLE NOT NULL,
+            secondary_topics_json STRING NOT NULL,
+            entities_json STRING NOT NULL
         )
         USING DELTA
         """
+    )
+    _add_columns_if_missing(
+        spark,
+        tables.news_articles_fqn,
+        {
+            "primary_topic": "STRING",
+            "primary_topic_name": "STRING",
+            "topic_confidence": "DOUBLE",
+            "secondary_topics_json": "STRING",
+            "entities_json": "STRING",
+            "source_category_name": "STRING",
+            "source_category_url": "STRING",
+        },
     )
 
 
@@ -134,14 +186,132 @@ def ensure_articles_clean_table(spark: Any, tables: TableNames) -> None:
             summary_raw STRING,
             content STRING NOT NULL,
             category STRING,
+            source_category_name STRING,
+            source_category_url STRING,
             published_at TIMESTAMP,
             crawled_at TIMESTAMP NOT NULL,
             content_hash STRING NOT NULL,
             dedup_group_id STRING NOT NULL,
             is_duplicate BOOLEAN NOT NULL,
             created_at TIMESTAMP NOT NULL,
-            updated_at TIMESTAMP NOT NULL
+            updated_at TIMESTAMP NOT NULL,
+            primary_topic STRING NOT NULL,
+            primary_topic_name STRING NOT NULL,
+            topic_confidence DOUBLE NOT NULL,
+            secondary_topics_json STRING NOT NULL,
+            entities_json STRING NOT NULL
         )
         USING DELTA
         """
     )
+    _add_columns_if_missing(
+        spark,
+        tables.articles_clean_fqn,
+        {
+            "primary_topic": "STRING",
+            "primary_topic_name": "STRING",
+            "topic_confidence": "DOUBLE",
+            "secondary_topics_json": "STRING",
+            "entities_json": "STRING",
+            "source_category_name": "STRING",
+            "source_category_url": "STRING",
+        },
+    )
+
+
+def ensure_article_images_table(spark: Any, tables: TableNames) -> None:
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {tables.article_images_fqn} (
+            id STRING NOT NULL,
+            article_id STRING NOT NULL,
+            source STRING NOT NULL,
+            canonical_url STRING NOT NULL,
+            image_url STRING NOT NULL,
+            caption STRING,
+            alt_text STRING,
+            credit STRING,
+            position INT NOT NULL,
+            width INT,
+            height INT,
+            image_type STRING NOT NULL,
+            is_representative BOOLEAN NOT NULL,
+            created_at TIMESTAMP
+        )
+        USING DELTA
+        """
+    )
+
+
+def ensure_sports_tables(spark: Any, tables: TableNames) -> None:
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {tables.sports_leagues_fqn} (
+            league_id STRING NOT NULL,
+            source STRING NOT NULL,
+            source_url STRING,
+            name STRING NOT NULL,
+            country STRING,
+            season STRING,
+            created_at TIMESTAMP
+        )
+        USING DELTA
+        """
+    )
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {tables.sports_matches_fqn} (
+            match_id STRING NOT NULL,
+            source STRING NOT NULL,
+            source_url STRING,
+            league_id STRING,
+            league_name STRING,
+            season STRING,
+            round STRING,
+            home_team STRING,
+            away_team STRING,
+            kickoff_at TIMESTAMP,
+            status STRING,
+            home_score INT,
+            away_score INT,
+            created_at TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+        USING DELTA
+        """
+    )
+    spark.sql(
+        f"""
+        CREATE TABLE IF NOT EXISTS {tables.sports_standings_fqn} (
+            standing_id STRING NOT NULL,
+            source STRING NOT NULL,
+            source_url STRING,
+            league_id STRING,
+            league_name STRING,
+            season STRING,
+            team STRING NOT NULL,
+            rank INT,
+            played INT,
+            points INT,
+            wins INT,
+            draws INT,
+            losses INT,
+            goals_for INT,
+            goals_against INT,
+            updated_at TIMESTAMP
+        )
+        USING DELTA
+        """
+    )
+
+
+def _add_columns_if_missing(spark: Any, table_name: str, columns: dict[str, str]) -> None:
+    try:
+        existing_columns = set(spark.table(table_name).columns)
+    except Exception:
+        return
+    missing_columns = [(name, data_type) for name, data_type in columns.items() if name not in existing_columns]
+    if not missing_columns:
+        return
+    columns_sql = ", ".join(f"{name} {data_type}" for name, data_type in missing_columns)
+    spark.sql(f"ALTER TABLE {table_name} ADD COLUMNS ({columns_sql})")

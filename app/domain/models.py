@@ -80,6 +80,8 @@ class Article:
     summary_raw: str | None
     content: str
     category: str | None
+    source_category_name: str | None
+    source_category_url: str | None
     published_at: datetime | None
     crawled_at: datetime
     content_hash: str
@@ -88,3 +90,26 @@ class Article:
     created_at: datetime
     updated_at: datetime
     raw_id: str | None = None
+    primary_topic: str = "general_news"
+    primary_topic_name: str = "Tin tổng hợp"
+    topic_confidence: float = 0.0
+    secondary_topics_json: str = "[]"
+    entities_json: str = "[]"
+
+
+@dataclass(slots=True)
+class ArticleImage:
+    id: str
+    article_id: str
+    source: str
+    canonical_url: str
+    image_url: str
+    caption: str | None = None
+    alt_text: str | None = None
+    credit: str | None = None
+    position: int = 0
+    width: int | None = None
+    height: int | None = None
+    image_type: str = "unknown"
+    is_representative: bool = False
+    created_at: datetime | None = None

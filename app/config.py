@@ -11,6 +11,10 @@ class TableNames:
     raw_documents: str = "news_raw_documents"
     news_articles: str = "news_articles"
     articles_clean: str = "articles_clean"
+    article_images: str = "news_article_images"
+    sports_matches: str = "sports_matches"
+    sports_standings: str = "sports_standings"
+    sports_leagues: str = "sports_leagues"
 
     @property
     def schema_fqn(self) -> str:
@@ -28,6 +32,22 @@ class TableNames:
     def articles_clean_fqn(self) -> str:
         return f"{self.schema_fqn}.{self.articles_clean}"
 
+    @property
+    def article_images_fqn(self) -> str:
+        return f"{self.schema_fqn}.{self.article_images}"
+
+    @property
+    def sports_matches_fqn(self) -> str:
+        return f"{self.schema_fqn}.{self.sports_matches}"
+
+    @property
+    def sports_standings_fqn(self) -> str:
+        return f"{self.schema_fqn}.{self.sports_standings}"
+
+    @property
+    def sports_leagues_fqn(self) -> str:
+        return f"{self.schema_fqn}.{self.sports_leagues}"
+
 
 @dataclass(frozen=True)
 class CrawlSettings:
@@ -39,6 +59,7 @@ class CrawlSettings:
     stop_after_empty_pages: int
     stop_after_duplicate_pages: int
     request_delay_seconds: float
+    max_concurrent_requests: int
     request_timeout_seconds: int
     retry_count: int
     user_agent: str
@@ -48,11 +69,13 @@ class CrawlSettings:
 class LocalAiSettings:
     databricks_articles_table: str
     embedding_model_name: str
+    embedding_batch_size: int
     chroma_persist_dir: str
     chroma_collection_name: str
     ollama_base_url: str | None
     ollama_model: str | None
     rag_retrieve_top_n: int
+    rag_retrieval_mode: str
     rag_broad_retrieve_top_n: int
     rag_top_k: int
     rag_min_score: float
@@ -96,6 +119,14 @@ def _bool_env(name: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _first_env(names: tuple[str, ...], default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
 def load_settings() -> Settings:
     tables = TableNames(
         catalog=os.getenv("DATABRICKS_CATALOG", "main"),
@@ -106,10 +137,11 @@ def load_settings() -> Settings:
         max_articles_per_source=_int_env("MAX_ARTICLES_PER_SOURCE", 20),
         crawl_mode=os.getenv("CRAWL_MODE", "category_pagination"),
         discover_categories=_bool_env("DISCOVER_CATEGORIES", True),
-        max_pages_per_category=_int_env("MAX_PAGES_PER_CATEGORY", 6),
+        max_pages_per_category=_int_env("MAX_PAGES_PER_CATEGORY", 5),
         stop_after_empty_pages=_int_env("STOP_AFTER_EMPTY_PAGES", 3),
         stop_after_duplicate_pages=_int_env("STOP_AFTER_DUPLICATE_PAGES", 3),
         request_delay_seconds=_float_env("REQUEST_DELAY_SECONDS", 1.0),
+        max_concurrent_requests=_int_env("MAX_CONCURRENT_REQUESTS", 4),
         request_timeout_seconds=_int_env("REQUEST_TIMEOUT_SECONDS", 15),
         retry_count=_int_env("REQUEST_RETRY_COUNT", 2),
         user_agent=os.getenv(
@@ -122,12 +154,23 @@ def load_settings() -> Settings:
             "DATABRICKS_ARTICLES_TABLE",
             "main.news_ai.articles_clean",
         ),
-        embedding_model_name=os.getenv(
-            "LOCAL_EMBEDDING_MODEL",
-            "sentence-transformers/all-MiniLM-L6-v2",
+        embedding_model_name=_first_env(
+            (
+                "EMBEDDING_MODEL_NAME",
+                "EMBEDDING_MODEL",
+                "NEWS_EMBEDDING_MODEL",
+                "LOCAL_EMBEDDING_MODEL",
+                "SENTENCE_TRANSFORMER_MODEL",
+            ),
+            "paraphrase-multilingual-MiniLM-L12-v2",
         ),
-        chroma_persist_dir=os.getenv(
-            "CHROMA_PERSIST_DIR",
+        embedding_batch_size=_int_env("EMBEDDING_BATCH_SIZE", 64),
+        chroma_persist_dir=_first_env(
+            (
+                "CHROMA_PERSIST_DIR",
+                "CHROMA_PATH",
+                "VECTOR_STORE_PATH",
+            ),
             "data/chroma",
         ),
         chroma_collection_name=os.getenv(
@@ -137,6 +180,7 @@ def load_settings() -> Settings:
         ollama_base_url=os.getenv("OLLAMA_BASE_URL"),
         ollama_model=os.getenv("OLLAMA_MODEL"),
         rag_retrieve_top_n=_int_env("RAG_RETRIEVE_TOP_N", 12),
+        rag_retrieval_mode=os.getenv("RAG_RETRIEVAL_MODE", "hybrid").strip().lower(),
         rag_broad_retrieve_top_n=_int_env("RAG_BROAD_RETRIEVE_TOP_N", 30),
         rag_top_k=_int_env("RAG_TOP_K", 4),
         rag_min_score=_float_env("RAG_MIN_SCORE", 0.35),

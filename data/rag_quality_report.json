@@ -1,0 +1,431 @@
+{
+  "summary": {
+    "total": 6,
+    "ok": 5,
+    "warn": 1,
+    "fail": 0,
+    "duration_seconds": 421.6035
+  },
+  "issues": {
+    "empty_sources": 1,
+    "hallucination_risk": 1,
+    "multi_source_weak": 1,
+    "stale_sources": 1
+  },
+  "results": [
+    {
+      "id": "latest_ai_news",
+      "query": "tin AI moi nhat",
+      "status": "OK",
+      "expected": {
+        "expected_intent": "latest_news",
+        "expected_topic_contains": [
+          "ai",
+          "technology",
+          "cong_nghe",
+          "tech"
+        ],
+        "min_sources": 2,
+        "requires_images": false,
+        "requires_recent": true,
+        "requires_multi_source": true
+      },
+      "scores": {
+        "schema": "OK",
+        "intent": "OK",
+        "topic": "OK",
+        "sources": "OK",
+        "multi_source": "OK",
+        "entities": "SKIP",
+        "images": "SKIP",
+        "related_articles": "OK",
+        "answer": "OK",
+        "recency": "OK"
+      },
+      "actual": {
+        "intent": "latest_news",
+        "topic": "tech_ai_internet",
+        "source_count": 9,
+        "unique_source_count": 4,
+        "image_count": 9,
+        "related_count": 9,
+        "retrieval_mode": "hybrid"
+      },
+      "warnings": [],
+      "errors": [],
+      "answer_preview": "Dựa trên các bài báo hệ thống đã thu thập hiện tại, tôi không có thông tin đủ để trả lời câu hỏi này.",
+      "sources_preview": [
+        {
+          "title": "AI và bài toán niềm tin trong ngành dịch vụ",
+          "source": "diendandoanhnghiep",
+          "url": "https://diendandoanhnghiep.vn/ai-va-bai-toan-niem-tin-trong-nganh-dich-vu-10178344.html",
+          "published_at": "2026-06-05 11:09:01"
+        },
+        {
+          "title": "Bài toán thiết kế website doanh nghiệp chuyển đổi số thời AI",
+          "source": "vnexpress",
+          "url": "https://vnexpress.net/bai-toan-thiet-ke-website-doanh-nghiep-chuyen-doi-so-thoi-ai-5079805.html",
+          "published_at": "2026-06-01 09:00:00"
+        },
+        {
+          "title": "Cảnh báo: Câu trả lời từ AI không phải là nguồn đáng tin cậy. Vì sao?",
+          "source": "cafef",
+          "url": "https://cafef.vn/canh-bao-cau-tra-loi-tu-ai-khong-phai-la-nguon-dang-tin-cay-vi-sao-188260602143926604.chn",
+          "published_at": "2026-06-02 15:05:00"
+        },
+        {
+          "title": "Thử nghiệm chấn động vạch trần mặt tối của các siêu AI khi không có sự can thiệp của con người",
+          "source": "genk",
+          "url": "https://genk.vn/thu-nghiem-chan-dong-vach-tran-mat-toi-cua-cac-sieu-ai-khi-khong-co-su-can-thiep-cua-con-nguoi-165260602101523668.chn",
+          "published_at": "2026-06-02 10:30:00"
+        },
+        {
+          "title": "Thử nghiệm chấn động vạch trần mặt tối của các siêu AI khi không có sự can thiệp của con người",
+          "source": "cafef",
+          "url": "https://cafef.vn/thu-nghiem-chan-dong-vach-tran-mat-toi-cua-cac-sieu-ai-khi-khong-co-su-can-thiep-cua-con-nguoi-188260601084403594.chn",
+          "published_at": "2026-06-01 10:30:00"
+        }
+      ],
+      "duration_seconds": 76.5722
+    },
+    {
+      "id": "world_today",
+      "query": "tinh hinh the gioi hom nay",
+      "status": "WARN",
+      "expected": {
+        "expected_intent": "latest_news",
+        "expected_topic_contains": [
+          "world",
+          "quoc_te",
+          "geopolitics"
+        ],
+        "min_sources": 2,
+        "requires_images": false,
+        "requires_recent": true,
+        "requires_multi_source": true
+      },
+      "scores": {
+        "schema": "OK",
+        "intent": "OK",
+        "topic": "OK",
+        "sources": "WARN",
+        "multi_source": "WARN",
+        "entities": "SKIP",
+        "images": "SKIP",
+        "related_articles": "OK",
+        "answer": "WARN",
+        "recency": "WARN"
+      },
+      "actual": {
+        "intent": "latest_news",
+        "topic": "world_geopolitics",
+        "source_count": 0,
+        "unique_source_count": 0,
+        "image_count": 0,
+        "related_count": 0,
+        "retrieval_mode": null
+      },
+      "warnings": [
+        "empty_sources: expected at least 2, got 0",
+        "multi_source_weak: requires multiple sources but fewer than two were returned",
+        "hallucination_risk: answer without sources does not look like fallback",
+        "stale_sources: no published_at values to evaluate recency"
+      ],
+      "errors": [],
+      "answer_preview": "Dựa trên các bài báo hệ thống đã thu thập hiện tại, tôi chưa có thông tin đủ để trả lời câu hỏi này.",
+      "sources_preview": [],
+      "duration_seconds": 20.2961
+    },
+    {
+      "id": "hpg_news",
+      "query": "HPG co gi moi",
+      "status": "OK",
+      "expected": {
+        "expected_intent": "entity_news",
+        "expected_topic_contains": [
+          "finance",
+          "stock",
+          "kinh_te",
+          "chung_khoan"
+        ],
+        "expected_entities": [
+          "HPG",
+          "Hoa Phat"
+        ],
+        "min_sources": 1,
+        "requires_images": false,
+        "requires_recent": true
+      },
+      "scores": {
+        "schema": "OK",
+        "intent": "OK",
+        "topic": "OK",
+        "sources": "OK",
+        "multi_source": "SKIP",
+        "entities": "OK",
+        "images": "SKIP",
+        "related_articles": "OK",
+        "answer": "OK",
+        "recency": "OK"
+      },
+      "actual": {
+        "intent": "entity_news",
+        "topic": "economy_finance_stock",
+        "source_count": 8,
+        "unique_source_count": 2,
+        "image_count": 6,
+        "related_count": 8,
+        "retrieval_mode": "hybrid"
+      },
+      "warnings": [],
+      "errors": [],
+      "answer_preview": "Trong bối cảnh VN-Index chưa thoát xu hướng đi xuống, nhóm phân tích Công ty Chứng khoán Vietcombank cho rằng nhà đầu tư cần thận trọng hơn khi mua mới. [1] Áp lực rút vốn tập trung nhiều nhất ở ACB, HPG và HDB. [1] Ở chiều ngược lại, áp lực bán ròng tập trung mạnh nhất tại HPG với giá trị khoảng 124 tỷ đồng. [2]",
+      "sources_preview": [
+        {
+          "title": "Phiên 2/6: Khối ngoại tiếp đà bán ròng, ngược chiều “tung” gần 500 tỷ gom một cổ phiếu VN30",
+          "source": "cafef",
+          "url": "https://cafef.vn/phien-2-6-khoi-ngoai-tiep-da-ban-rong-nguoc-chieu-tung-gan-500-ty-gom-mot-co-phieu-vn30-188260602152837542.chn",
+          "published_at": "2026-06-02 15:45:00"
+        },
+        {
+          "title": "Một cổ phiếu được 43 quỹ cùng \"xuống tiền\" trước khi VN-Index lập đỉnh",
+          "source": "cafef",
+          "url": "https://cafef.vn/mot-co-phieu-duoc-43-quy-cung-xuong-tien-truoc-khi-vn-index-lap-dinh-188260602223149441.chn",
+          "published_at": "2026-06-03 00:06:00"
+        },
+        {
+          "title": "VN-Index giảm 6 phiên liên tiếp",
+          "source": "vnexpress",
+          "url": "https://vnexpress.net/vn-index-giam-6-phien-lien-tiep-5081112.html",
+          "published_at": "2026-06-02 08:35:00"
+        },
+        {
+          "title": "Một thế lực vừa \"xả\" ròng 1.000 tỷ đồng cổ phiếu HOSE phiên giảm điểm, NVL bị bán mạnh nhất",
+          "source": "cafef",
+          "url": "https://cafef.vn/mot-the-luc-vua-xa-rong-1000-ty-dong-co-phieu-hose-phien-giam-diem-nvl-bi-ban-manh-nhat-188260603192923143.chn",
+          "published_at": "2026-06-03 19:29:00"
+        },
+        {
+          "title": "Các quỹ ETF sẽ tái cơ cấu danh mục ra sao trong kỳ quý II/2026?",
+          "source": "cafef",
+          "url": "https://cafef.vn/cac-quy-etf-se-tai-co-cau-danh-muc-ra-sao-trong-ky-quy-ii-2026-188260603171932327.chn",
+          "published_at": "2026-06-03 17:20:00"
+        }
+      ],
+      "duration_seconds": 76.7938
+    },
+    {
+      "id": "ukraine_images",
+      "query": "cho toi cac bai co anh ve Ukraine",
+      "status": "OK",
+      "expected": {
+        "expected_intent": "media_lookup",
+        "expected_entities": [
+          "Ukraine"
+        ],
+        "min_sources": 1,
+        "min_images": 1,
+        "requires_images": true
+      },
+      "scores": {
+        "schema": "OK",
+        "intent": "OK",
+        "topic": "SKIP",
+        "sources": "OK",
+        "multi_source": "SKIP",
+        "entities": "OK",
+        "images": "OK",
+        "related_articles": "OK",
+        "answer": "OK",
+        "recency": "SKIP"
+      },
+      "actual": {
+        "intent": "media_lookup",
+        "topic": "world_geopolitics",
+        "source_count": 7,
+        "unique_source_count": 2,
+        "image_count": 14,
+        "related_count": 7,
+        "retrieval_mode": "hybrid"
+      },
+      "warnings": [],
+      "errors": [],
+      "answer_preview": "\"Chúng tôi đã thấy bằng chứng cho thấy Nga hỗ trợ Iran trong các cuộc tấn công của họ\", Bộ trưởng Quốc phòng Anh John Healey phát biểu hồi tháng 4 tại cuộc họp của các đồng minh đang hỗ trợ quân sự cho Ukraine. [4] Đây là ưu tiên đặc biệt quan trọng với EU trong bối cảnh xung đột Ukraine và chính sách thuế quan của Tổng thống Trump, yếu tố cũng đang ảnh hưởng tới ASEAN. [1] Reuters Trong chuyến thăm gần đây tới một lữ đoàn ở miền tây Ukraine, Reshetylova rảo bước qua các lều trại của binh sĩ nằm...",
+      "sources_preview": [
+        {
+          "title": "Người phụ nữ đối đầu tướng lĩnh Ukraine để bảo vệ binh sĩ",
+          "source": "vnexpress",
+          "url": "https://vnexpress.net/nguoi-phu-nu-doi-dau-tuong-linh-ukraine-de-bao-ve-binh-si-5080384.html",
+          "published_at": "2026-06-01 22:00:00"
+        },
+        {
+          "title": "Hệ quả đan xen giữa chiến sự Ukraine và Iran",
+          "source": "vnexpress",
+          "url": "https://vnexpress.net/he-qua-dan-xen-giua-chien-su-ukraine-va-iran-5078610.html",
+          "published_at": "2026-05-31 22:00:00"
+        },
+        {
+          "title": "ASEAN - EU tăng cường gắn kết trong bối cảnh biến động toàn cầu",
+          "source": "diendandoanhnghiep",
+          "url": "https://diendandoanhnghiep.vn/asean-eu-tang-cuong-gan-ket-trong-boi-canh-bien-dong-toan-cau-10178555.html",
+          "published_at": "2026-10-05 03:24:01"
+        },
+        {
+          "title": "Nga tiếp nhận 'máy bay mắt thần' nâng cấp",
+          "source": "vnexpress",
+          "url": "https://vnexpress.net/nga-tiep-nhan-may-bay-mat-than-nang-cap-5080864.html",
+          "published_at": "2026-06-02 03:35:00"
+        },
+        {
+          "title": "Nga tìm cách xuyên phá vành đai pháo đài ở Donetsk",
+          "source": "vnexpress",
+          "url": "https://vnexpress.net/nga-tim-cach-xuyen-pha-vanh-dai-phao-dai-o-donetsk-5080630.html",
+          "published_at": "2026-06-01 11:12:00"
+        }
+      ],
+      "duration_seconds": 87.3327
+    },
+    {
+      "id": "cafef_stock_news",
+      "query": "tin tu CafeF ve chung khoan",
+      "status": "OK",
+      "expected": {
+        "expected_topic_contains": [
+          "finance",
+          "stock",
+          "chung_khoan",
+          "kinh_te"
+        ],
+        "expected_source": "cafef",
+        "min_sources": 1
+      },
+      "scores": {
+        "schema": "OK",
+        "intent": "SKIP",
+        "topic": "OK",
+        "sources": "OK",
+        "multi_source": "SKIP",
+        "entities": "SKIP",
+        "images": "SKIP",
+        "related_articles": "OK",
+        "answer": "OK",
+        "recency": "SKIP"
+      },
+      "actual": {
+        "intent": "topic_news",
+        "topic": "economy_finance_stock",
+        "source_count": 10,
+        "unique_source_count": 1,
+        "image_count": 9,
+        "related_count": 10,
+        "retrieval_mode": "hybrid"
+      },
+      "warnings": [],
+      "errors": [],
+      "answer_preview": "Căn cứ quy định tại Thông tư 96/2020/TT-BTC ngày 16/11/2020 hướng dẫn công bố thông tin trên thị trường chứng khoán, khoản 1 Điều 15 và điểm d khoản 1 Điều 11, Baf Việt Nam đã chậm công bố thông tin Nghị quyết HĐQT nêu trên. [1] Do đó, HoSE nhắc nhở và đề nghị công ty nghiêm túc tuân thủ quy định về công bố thông tin trên thị trường chứng khoán. [1] Bên cạnh tín dụng, ông Hoàng đánh giá đầu tư công, cải cách thể chế và câu chuyện nâng hạng thị trường vẫn sẽ là những động lực quan trọng hỗ trợ th...",
+      "sources_preview": [
+        {
+          "title": "Baf Việt Nam thâu tóm thêm doanh nghiệp chăn nuôi tại Quảng Trị",
+          "source": "cafef",
+          "url": "https://cafef.vn/baf-viet-nam-thau-tom-them-doanh-nghiep-chan-nuoi-tai-quang-tri-188260601094441753.chn",
+          "published_at": "2026-06-01 10:31:00"
+        },
+        {
+          "title": "Vietcap kết nối hành trình đầu tư với những giá trị gia đình trong tháng 6",
+          "source": "cafef",
+          "url": "https://cafef.vn/vietcap-ket-noi-hanh-trinh-dau-tu-voi-nhung-gia-tri-gia-dinh-trong-thang-6-18826060107281078.chn",
+          "published_at": "2026-06-01 08:00:00"
+        },
+        {
+          "title": "Chuyên gia: Đây không phải lúc bi quan, nhiều cổ phiếu đã về vùng giá thấp với câu chuyện hấp dẫn",
+          "source": "cafef",
+          "url": "https://cafef.vn/chuyen-gia-day-khong-phai-luc-bi-quan-nhieu-co-phieu-da-ve-vung-gia-thap-voi-cau-chuyen-hap-dan-188260531220839013.chn",
+          "published_at": "2026-06-01 00:03:00"
+        },
+        {
+          "title": "Tập trung \"tháo gỡ\" nhiều rào cản để thu hút nhà đầu tư chứng khoán",
+          "source": "cafef",
+          "url": "https://cafef.vn/tap-trung-thao-go-nhieu-rao-can-de-thu-hut-nha-dau-tu-chung-khoan-188260602214030565.chn",
+          "published_at": "2026-06-02 21:40:00"
+        },
+        {
+          "title": "ĐHĐCĐ Searefico (SRF): Lượng Backlog đạt kỷ lục 3.000 tỷ đồng, hoàn tất thương vụ M&A Arico thu về hơn 500 tỷ đồng",
+          "source": "cafef",
+          "url": "https://cafef.vn/dhdcd-searefico-srf-luong-backlog-dat-ky-luc-3000-ty-dong-hoan-tat-thuong-vu-ma-arico-thu-ve-hon-500-ty-dong-18826060116453919.chn",
+          "published_at": "2026-06-01 16:46:00"
+        }
+      ],
+      "duration_seconds": 80.6921
+    },
+    {
+      "id": "business_multi_source",
+      "query": "tong hop tin doanh nghiep moi nhat tu nhieu nguon",
+      "status": "OK",
+      "expected": {
+        "expected_topic_contains": [
+          "business",
+          "doanh_nghiep"
+        ],
+        "min_sources": 2,
+        "requires_multi_source": true
+      },
+      "scores": {
+        "schema": "OK",
+        "intent": "SKIP",
+        "topic": "OK",
+        "sources": "OK",
+        "multi_source": "OK",
+        "entities": "SKIP",
+        "images": "SKIP",
+        "related_articles": "OK",
+        "answer": "OK",
+        "recency": "SKIP"
+      },
+      "actual": {
+        "intent": "latest_news",
+        "topic": "business_startup",
+        "source_count": 9,
+        "unique_source_count": 2,
+        "image_count": 9,
+        "related_count": 9,
+        "retrieval_mode": "hybrid"
+      },
+      "warnings": [],
+      "errors": [],
+      "answer_preview": "Mới đây, ManageEngine, bộ phận trực thuộc Zoho Corporation và là nhà cung cấp giải pháp quản lý công nghệ thông tin doanh nghiệp vừa công bố nâng cấp kiến trúc lõi cho nền tảng bảo mật thống nhất Log360 với việc tích hợp tính năng SOAR gốc, nhằm thu hẹp khoảng cách từ phát hiện đến phản ứng thông qua tự động hóa đa miền cho doanh nghiệp. [1] Điều này lý giải vì sao các nhà cung cấp SIEM (hệ thống thu thập, lưu trữ, phân tích và tương quan dữ liệu log bảo mật từ nhiều nguồn khác nhau nhằm phát hi...",
+      "sources_preview": [
+        {
+          "title": "Doanh nghiệp tăng tốc xây dựng trung tâm điều hành an ninh mạng tự động",
+          "source": "diendandoanhnghiep",
+          "url": "https://diendandoanhnghiep.vn/doanh-nghiep-tang-toc-xay-dung-trung-tam-dieu-hanh-an-ninh-mang-tu-dong-10178712.html",
+          "published_at": "2026-12-05 23:42:01"
+        },
+        {
+          "title": "Data Talk",
+          "source": "cafef",
+          "url": "https://cafef.vn/data-talk.html",
+          "published_at": "2026-06-03 11:40:00"
+        },
+        {
+          "title": "Đón bắt cơ hội tham gia sâu vào chuỗi cung ứng ô tô",
+          "source": "diendandoanhnghiep",
+          "url": "https://diendandoanhnghiep.vn/don-bat-co-hoi-tham-gia-sau-vao-chuoi-cung-ung-o-to-10168664.html",
+          "published_at": "2026-09-01 00:30:01"
+        },
+        {
+          "title": "Cần các giải pháp hỗ trợ về dòng tiền",
+          "source": "diendandoanhnghiep",
+          "url": "https://diendandoanhnghiep.vn/can-cac-giai-phap-ho-tro-ve-dong-tien-10175702.html",
+          "published_at": "2026-06-04 03:17:01"
+        },
+        {
+          "title": "Nhiều doanh nghiệp lớn biến động nhân sự cấp cao",
+          "source": "cafef",
+          "url": "https://cafef.vn/nhieu-doanh-nghiep-lon-bien-dong-nhan-su-cap-cao-188260531141846459.chn",
+          "published_at": "2026-05-31 15:04:00"
+        }
+      ],
+      "duration_seconds": 79.916
+    }
+  ]
+}

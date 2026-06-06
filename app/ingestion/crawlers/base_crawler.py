@@ -72,16 +72,19 @@ class BaseCrawler:
         self.config = source_config
         self._seen_link_keys: set[str] = set()
         self._existing_link_keys: set[str] = set()
-        self._seen_content_hashes: set[str] = set()
         self._existing_content_hashes: set[str] = set()
+        self._seen_exact_document_keys: set[str] = set()
+        self._existing_exact_document_keys: set[str] = set()
 
     def set_existing_keys(
         self,
         link_keys: set[str] | None = None,
         content_hashes: set[str] | None = None,
+        exact_document_keys: set[str] | None = None,
     ) -> None:
         self._existing_link_keys = set(link_keys or set())
         self._existing_content_hashes = set(content_hashes or set())
+        self._existing_exact_document_keys = set(exact_document_keys or set())
 
     def fetch_url(self, url: str) -> FetchResponse:
         timeout = int(getattr(self.config, "timeout_seconds", 15))
@@ -189,7 +192,7 @@ class BaseCrawler:
             if not normalized:
                 continue
             link_key = self.link_key(normalized)
-            if link_key in self._existing_link_keys or link_key in self._seen_link_keys:
+            if link_key in self._seen_link_keys:
                 continue
             self._seen_link_keys.add(link_key)
             new_links.append(normalized)
@@ -213,24 +216,39 @@ class BaseCrawler:
         if article is None:
             return None
         if category is not None:
-            article.category = category.name
+            article.category = _source_category_path(category.url) or category.name
             article.category_url = category.url
+            article.metadata["source_category_name"] = category.name
+            article.metadata["source_category_url"] = category.url
         if category_page is not None:
             article.category_page = category_page
         return article
 
-    def should_skip_content_hash(self, content_hash: str) -> bool:
-        if not content_hash:
+    def should_skip_exact_existing_document(self, canonical_url: str, checksum: str) -> bool:
+        if not canonical_url or not checksum:
             return False
-        if content_hash in self._existing_content_hashes or content_hash in self._seen_content_hashes:
+        exact_key = exact_document_identity_key(self.source_name, canonical_url, checksum)
+        if exact_key in self._existing_exact_document_keys or exact_key in self._seen_exact_document_keys:
             return True
-        self._seen_content_hashes.add(content_hash)
+        if checksum in self._existing_content_hashes:
+            logger.info(
+                "[CRAWL] Keep article with same content hash because source or canonical_url is different source=%s canonical_url=%s",
+                self.source_name,
+                normalize_url(canonical_url),
+            )
+        return False
+
+    def should_skip_content_hash(self, content_hash: str) -> bool:
         return False
 
     def mark_existing_link(self, article_url: str, canonical_url: str | None = None) -> None:
         self._existing_link_keys.add(self.link_key(article_url))
         if canonical_url:
             self._existing_link_keys.add(self.link_key(canonical_url))
+
+    def mark_seen_document(self, canonical_url: str, checksum: str) -> None:
+        if canonical_url and checksum:
+            self._seen_exact_document_keys.add(exact_document_identity_key(self.source_name, canonical_url, checksum))
 
     def link_key(self, url: str) -> str:
         return raw_document_identity_key(self.source_name, url)
@@ -407,6 +425,8 @@ class BaseCrawler:
             "summary": article.summary,
             "content": article.content,
             "category": article.category,
+            "source_category_name": article.metadata.get("source_category_name"),
+            "source_category_url": article.metadata.get("source_category_url") or article.category_url,
             "published_at": article.published_at,
             "crawled_at": (article.crawled_at or now).isoformat(),
             "content_hash": article.content_hash or self.build_checksum(article),
@@ -424,6 +444,8 @@ class BaseCrawler:
             "article_url": article.url,
             "category": article.category,
             "category_url": article.category_url,
+            "source_category_name": article.metadata.get("source_category_name"),
+            "source_category_url": article.metadata.get("source_category_url") or article.category_url,
             "category_page": article.category_page,
             "canonical_url": article.canonical_url,
             "title": article.title,
@@ -570,11 +592,20 @@ def raw_document_identity_key(source_name: str, canonical_url: str) -> str:
     return f"{source_name}|{normalize_url(canonical_url)}"
 
 
+def exact_document_identity_key(source_name: str, canonical_url: str, checksum: str) -> str:
+    return f"{raw_document_identity_key(source_name, canonical_url)}|{checksum}"
+
+
 def _category_name_from_url(category_url: str) -> str:
     path = urlsplit(category_url).path.strip("/")
     if not path:
         return category_url
     return path.rsplit("/", 1)[-1].replace("-", " ").replace(".chn", "").strip()
+
+
+def _source_category_path(category_url: str) -> str:
+    path = urlsplit(category_url).path.strip("/")
+    return path or category_url
 
 
 def _fetch_with_requests(url: str, timeout: int, headers: dict[str, str]) -> FetchResponse:
